@@ -32,15 +32,17 @@ class SinkA(implicit p: Parameters) extends L2Module {
     val a = Flipped(DecoupledIO(new TLBundleA(edgeIn.bundle)))
     val prefetchReq = prefetchOpt.map(_ => Flipped(DecoupledIO(new PrefetchReq)))
     val task = DecoupledIO(new TaskBundle)
-    val cmoAll = Option.when(cacheParams.enableL2Flush) (new IOCMOAll)
+    val cmoAll = Option.when(cacheParams.enableL2Flush)(new IOCMOAll)
   })
-  assert(!(io.a.valid && (io.a.bits.opcode === PutFullData ||
-                          io.a.bits.opcode === PutPartialData)),
-    "no Put");
+  assert(
+    !(io.a.valid && (io.a.bits.opcode === PutFullData ||
+      io.a.bits.opcode === PutPartialData)),
+    "no Put"
+  );
 
   // flush L2 all control defines
-  val set = Option.when(cacheParams.enableL2Flush)(RegInit(0.U(setBits.W))) 
-  val way = Option.when(cacheParams.enableL2Flush)(RegInit(0.U(wayBits.W))) 
+  val set = Option.when(cacheParams.enableL2Flush)(RegInit(0.U(setBits.W)))
+  val way = Option.when(cacheParams.enableL2Flush)(RegInit(0.U(wayBits.W)))
   val sIDLE :: sCMOREQ :: sWAITLINE :: sWAITMSHR :: sDONE :: Nil = Enum(5)
   val state = Option.when(cacheParams.enableL2Flush)(RegInit(sIDLE))
   val stateVal = state.getOrElse(sIDLE)
@@ -51,6 +53,10 @@ class SinkA(implicit p: Parameters) extends L2Module {
   io.cmoAll.foreach { cmoAll => cmoAll.l2FlushDone := stateVal === sDONE }
   io.cmoAll.foreach { cmoAll => cmoAll.cmoAllBlock := cmoAllBlock }
 
+  def isMatrixGet(a: TLBundleA): Bool = {
+    val en = a.opcode === Get && (a.user.lift(MatrixKey).getOrElse(0.U) === 1.U)
+    en
+  }
   def fromTLAtoTaskBundle(a: TLBundleA): TaskBundle = {
     val task = Wire(new TaskBundle)
     task := 0.U.asTypeOf(new TaskBundle)
@@ -83,6 +89,7 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.wayMask := 0.U(cacheParams.ways.W)
     task.reqSource := a.user.lift(utility.ReqSourceKey).getOrElse(MemReqSource.NoWhere.id.U)
     task.replTask := false.B
+    task.matrixTask := isMatrixGet(a)
     task.vaddr.foreach(_ := a.user.lift(VaddrKey).getOrElse(0.U))
     //miss acquire keyword
     task.isKeyword.foreach(_ := a.echo.lift(IsKeywordKey).getOrElse(false.B))
@@ -134,82 +141,92 @@ class SinkA(implicit p: Parameters) extends L2Module {
     io.task.bits := Mux(
       io.a.valid || cmoAllValid,
       fromTLAtoTaskBundle(io.a.bits),
-      fromPrefetchReqtoTaskBundle(io.prefetchReq.get.bits
-    ))
+      fromPrefetchReqtoTaskBundle(io.prefetchReq.get.bits)
+    )
     io.a.ready := io.task.ready && !cmoAllBlock
     io.prefetchReq.get.ready := io.task.ready && !io.a.valid
   } else {
     io.task.valid := io.a.valid && !cmoAllBlock || cmoAllValid
-    io.task.bits := fromTLAtoTaskBundle(io.a.bits) 
+    io.task.bits := fromTLAtoTaskBundle(io.a.bits)
     io.a.ready := io.task.ready && !cmoAllBlock
   }
 
   /*
    Flush L2 All means search all L2$ VALID cacheLine and RELEASE to Downwords memory:
    -------------------------------------------------------------------------------------------------------
-          Step by Step                                                   |    Interface 
+          Step by Step                                                   |    Interface
    ----------------------------------------------------------------------|--------------------------------
-   0. Core initiate flush L2$ All operation                              |  io.cmoAll.l2Flush 
-   1. wait all mshrs done, block sinkA/C by ready until l2 flush done    |  io.cmoAll.cmoAllBlock 
+   0. Core initiate flush L2$ All operation                              |  io.cmoAll.l2Flush
+   1. wait all mshrs done, block sinkA/C by ready until l2 flush done    |  io.cmoAll.cmoAllBlock
    2. search all cacheline set with a loop (0 ~ numSets)                 |  io.task.set
    3. for each set, search all ways with a loop (0 ~ numWays)            |  io.task.way
    4. if cacheline is VALID, after cmo flush, Mainpipe send back resp    |  io.cmoAll.cmoLineDone
    5. if cacheline is INVALID, MainPipe drop it and send back resp       |  io.cmoAll.cmoLineDone
-   6. after all slices is flushed, inform Core                           |  io.cmoAll.l2FlushDone 
+   6. after all slices is flushed, inform Core                           |  io.cmoAll.l2FlushDone
    7. after all slices is flushed, exit coherency                        |  TL2CHICoupledL2.io_chi.syscoreq
    ---------------------------------------------------------------------------------------------------------*/
   val l2Flush = io.cmoAll.map(_.l2Flush).getOrElse(false.B)
   val mshrValid = io.cmoAll.map(_.mshrValid).getOrElse(false.B)
   val cmoLineDone = io.cmoAll.map(_.cmoLineDone).getOrElse(false.B)
 
-  when (stateVal === sIDLE && l2Flush && !mshrValid) {
+  when(stateVal === sIDLE && l2Flush && !mshrValid) {
     state.foreach { _ := sCMOREQ }
   }
-  when (stateVal === sCMOREQ && io.task.fire) {
+  when(stateVal === sCMOREQ && io.task.fire) {
     state.foreach { _ := sWAITLINE }
   }
-  when (stateVal === sWAITLINE && cmoLineDone) {
-    when (setVal === (cacheParams.sets-1).U && wayVal === (cacheParams.ways-1).U) { 
+  when(stateVal === sWAITLINE && cmoLineDone) {
+    when(setVal === (cacheParams.sets - 1).U && wayVal === (cacheParams.ways - 1).U) {
       state.foreach { _ := sDONE }
     }.otherwise {
-      when (wayVal === (cacheParams.ways-1).U) {
+      when(wayVal === (cacheParams.ways - 1).U) {
         way.foreach { _ := 0.U }
         set.foreach { _ := setVal + 1.U }
       }.otherwise {
         way.foreach { _ := wayVal + 1.U }
       }
-      when (mshrValid) {
+      when(mshrValid) {
         state.foreach { _ := sCMOREQ }
       }.otherwise {
         state.foreach { _ := sWAITMSHR }
       }
     }
   }
-  when (stateVal === sWAITMSHR && !mshrValid) {
+  when(stateVal === sWAITMSHR && !mshrValid) {
     state.foreach { _ := sCMOREQ }
   }
 
   // Performance counters
   // num of reqs
   XSPerfAccumulate("sinkA_req", io.task.fire)
-  XSPerfAccumulate("sinkA_acquire_req", io.a.fire && (io.a.bits.opcode === AcquirePerm || io.a.bits.opcode === AcquireBlock))
+  XSPerfAccumulate(
+    "sinkA_acquire_req",
+    io.a.fire && (io.a.bits.opcode === AcquirePerm || io.a.bits.opcode === AcquireBlock)
+  )
   XSPerfAccumulate("sinkA_acquireblock_req", io.a.fire && io.a.bits.opcode === AcquireBlock)
   XSPerfAccumulate("sinkA_acquireperm_req", io.a.fire && io.a.bits.opcode === AcquirePerm)
   XSPerfAccumulate("sinkA_get_req", io.a.fire && io.a.bits.opcode === Get)
-  prefetchOpt.foreach {
-    _ =>
-      XSPerfAccumulate("sinkA_prefetch_req", io.prefetchReq.get.fire)
-      XSPerfAccumulate("sinkA_prefetch_from_l2", io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
-      XSPerfAccumulate("sinkA_prefetch_from_l1", !io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
+  prefetchOpt.foreach { _ =>
+    XSPerfAccumulate("sinkA_prefetch_req", io.prefetchReq.get.fire)
+    XSPerfAccumulate("sinkA_prefetch_from_l2", io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
+    XSPerfAccumulate("sinkA_prefetch_from_l1", !io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
   }
 
   // cycels stalled by mainpipe
   val stall = io.task.valid && !io.task.ready
   XSPerfAccumulate("sinkA_stall_by_mainpipe", stall)
-  XSPerfAccumulate("sinkA_acquire_stall_by_mainpipe", stall &&
-    (io.task.bits.opcode === AcquireBlock || io.task.bits.opcode === AcquirePerm))
+  XSPerfAccumulate(
+    "sinkA_acquire_stall_by_mainpipe",
+    stall &&
+      (io.task.bits.opcode === AcquireBlock || io.task.bits.opcode === AcquirePerm)
+  )
   XSPerfAccumulate("sinkA_get_stall_by_mainpipe", stall && io.task.bits.opcode === Get)
-  XSPerfAccumulate("sinkA_put_stall_by_mainpipe", stall &&
-    (io.task.bits.opcode === PutFullData || io.task.bits.opcode === PutPartialData))
-  prefetchOpt.foreach { _ => XSPerfAccumulate("sinkA_prefetch_stall_by_mainpipe", stall && io.task.bits.opcode === Hint) }
+  XSPerfAccumulate(
+    "sinkA_put_stall_by_mainpipe",
+    stall &&
+      (io.task.bits.opcode === PutFullData || io.task.bits.opcode === PutPartialData)
+  )
+  prefetchOpt.foreach { _ =>
+    XSPerfAccumulate("sinkA_prefetch_stall_by_mainpipe", stall && io.task.bits.opcode === Hint)
+  }
 }

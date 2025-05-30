@@ -190,7 +190,7 @@ class RequestArb(implicit p: Parameters) extends L2Module
   /* ========  Stage 2 ======== */
   val s1_AHint_fire = io.sinkA.fire && io.sinkA.bits.opcode === Hint
   // any req except AHint might access DS, and continuous DS accesses are prohibited
-  val ds_mcp2_stall = RegNext(s1_fire && !s1_AHint_fire)
+  val ds_mcp2_stall = if(enableMCP2) RegNext(s1_fire && !s1_AHint_fire) else false.B
 
   s2_ready  := !ds_mcp2_stall
 
@@ -258,6 +258,11 @@ class RequestArb(implicit p: Parameters) extends L2Module
     task_s2.bits.readProbeDataDown || mshrTask_s2_a_upwards && task_s2.bits.useProbeData,
     snpHitReleaseNeedData
   )
+  // chnl_task_s1.bits.opcode === PutFullData
+  // task_s2
+  when(chnl_task_s1.bits.opcode === PutFullData){
+    // printf(s"TODO: Requires RequestArb to support PutFullData!\n")
+  }
   io.releaseBufRead_s2.bits.id := Mux(
     task_s2.bits.snpHitRelease,
     task_s2.bits.snpHitReleaseIdx,

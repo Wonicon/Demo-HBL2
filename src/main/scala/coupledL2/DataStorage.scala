@@ -1,19 +1,19 @@
 /** *************************************************************************************
- * Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
- * Copyright (c) 2020-2021 Peng Cheng Laboratory
- *
- * XiangShan is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- * http://license.coscl.org.cn/MulanPSL2
- *
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- *
- * See the Mulan PSL v2 for more details.
- * *************************************************************************************
- */
+  * Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+  * Copyright (c) 2020-2021 Peng Cheng Laboratory
+  *
+  * XiangShan is licensed under Mulan PSL v2.
+  * You can use this software according to the terms and conditions of the Mulan PSL v2.
+  * You may obtain a copy of Mulan PSL v2 at:
+  * http://license.coscl.org.cn/MulanPSL2
+  *
+  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+  *
+  * See the Mulan PSL v2 for more details.
+  * *************************************************************************************
+  */
 
 package coupledL2
 
@@ -46,7 +46,6 @@ class DSECCBankBlock(implicit p: Parameters) extends L2Bundle {
   }
 }
 
-
 class DataStorage(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
     // en is the actual r/w valid from mainpipe (last for one cycle)
@@ -66,17 +65,19 @@ class DataStorage(implicit p: Parameters) extends L2Module {
   })
 
   // read data is set MultiCycle Path 2
-  val array = Module(new GatedSplittedSRAM(
-    gen = new DSECCBankBlock,
-    set = blocks,
-    way = 1,
-    dataSplit = dataSRAMSplit,
-    singlePort = true,
-    readMCP2 = true,
-    hasMbist = p(L2ParamKey).hasMbist,
-    hasSramCtl = p(L2ParamKey).hasSramCtl,
-    extraHold = true
-  ))
+  val array = Module(
+    new GatedSplittedSRAM(
+      gen = new DSECCBankBlock,
+      set = blocks,
+      way = 1,
+      dataSplit = dataSRAMSplit,
+      singlePort = true,
+      readMCP2 = enableMCP2,
+      hasMbist = p(L2ParamKey).hasMbist,
+      hasSramCtl = p(L2ParamKey).hasSramCtl,
+      extraHold = true
+    )
+  )
   array.io_en := io.en
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(1, "L2DataStorage", p(L2ParamKey).hasMbist)
 
@@ -86,8 +87,14 @@ class DataStorage(implicit p: Parameters) extends L2Module {
 
   val arrayWrite = Wire(new DSECCBankBlock)
   val arrayWriteData = if (enableDataECC) {
-    Cat(0.U(encDataPadBits.W), Cat(VecInit(Seq.tabulate(dataBankSplit)(i =>
-      io.wdata.data(dataBankBits * (i + 1) - 1, dataBankBits * i))).map(data => cacheParams.dataCode.encode(data))))
+    Cat(
+      0.U(encDataPadBits.W),
+      Cat(
+        VecInit(Seq.tabulate(dataBankSplit)(i => io.wdata.data(dataBankBits * (i + 1) - 1, dataBankBits * i))).map(
+          data => cacheParams.dataCode.encode(data)
+        )
+      )
+    )
   } else {
     io.wdata.data
   }
@@ -96,7 +103,13 @@ class DataStorage(implicit p: Parameters) extends L2Module {
   val arrayRead = array.io.r.resp.data(0)
   val dataRead = Wire(new DSBlock)
   val bankDataRead = if (enableDataECC) {
-    Cat(VecInit(Seq.tabulate(dataBankSplit)(i => arrayRead.data(encBankBits * (i + 1) - 1, encBankBits * i)(dataBankBits - 1, 0))))
+    Cat(
+      VecInit(
+        Seq.tabulate(dataBankSplit)(i =>
+          arrayRead.data(encBankBits * (i + 1) - 1, encBankBits * i)(dataBankBits - 1, 0)
+        )
+      )
+    )
   } else {
     arrayRead.data
   }
@@ -109,23 +122,30 @@ class DataStorage(implicit p: Parameters) extends L2Module {
 
   val error = if (enableDataECC) {
     // cacheParams.dataCode.decode(eccData).error && RegNext(RegNext(io.req.valid && !io.req.bits.wen))
-    VecInit(Seq.tabulate(dataBankSplit)(i => arrayRead.data(encBankBits * (i + 1) - 1, encBankBits * i))).
-      map(data => cacheParams.dataCode.decode(data).error).reduce(_ | _) && RegNext(RegNext(io.req.valid && !io.req.bits.wen))
+    VecInit(Seq.tabulate(dataBankSplit)(i => arrayRead.data(encBankBits * (i + 1) - 1, encBankBits * i)))
+      .map(data => cacheParams.dataCode.decode(data).error)
+      .reduce(_ | _) && RegNext(RegNext(io.req.valid && !io.req.bits.wen))
   } else {
     false.B
   }
 
   // for timing, we set this as multicycle path
   // s3 read, s4 pass and s5 to destination
-  io.rdata := dataRead
+  // (if not MCP2, then we need to latch at s4)
+  io.rdata := { if (enableMCP2) dataRead else RegNext(dataRead) }
   io.error := error
 
-  assert(!io.en || !RegNext(io.en, false.B),
-    "Continuous SRAM req prohibited under MCP2!")
+  if (enableMCP2) {
+    assert(!io.en || !RegNext(io.en, false.B), "Continuous SRAM req prohibited under MCP2!")
 
-  assert(!(RegNext(io.en) && (io.req.asUInt =/= RegNext(io.req.asUInt))),
-    s"DataStorage req fails to hold for 2 cycles!")
+    assert(
+      !(RegNext(io.en) && (io.req.asUInt =/= RegNext(io.req.asUInt))),
+      s"DataStorage req fails to hold for 2 cycles!"
+    )
 
-  assert(!(RegNext(io.en && io.req.bits.wen) && (io.wdata.asUInt =/= RegNext(io.wdata.asUInt))),
-    s"DataStorage wdata fails to hold for 2 cycles!")
+    assert(
+      !(RegNext(io.en && io.req.bits.wen) && (io.wdata.asUInt =/= RegNext(io.wdata.asUInt))),
+      s"DataStorage wdata fails to hold for 2 cycles!"
+    )
+  }
 }

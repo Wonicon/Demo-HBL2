@@ -122,6 +122,11 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     a.fromA && (a.opcode === AcquireBlock || a.opcode === AcquirePerm)
   )).asUInt.orR
 
+  def latePut(a: TaskBundle): Bool = {
+    VecInit(io.mshrInfo.map(s =>
+      a.fromA && (a.opcode === PutFullData || a.opcode === PutPartialData)
+    )).asUInt.orR
+  }
   // count ways
 //  def countWaysOH(cond: (MSHRInfo => Bool)): UInt = {
 //    VecInit(io.mshrInfo.map(s =>
@@ -136,8 +141,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // other flags
   val in      = io.in.bits
   val full    = Cat(buffer.map(_.valid)).andR
-
-  //
   val mshrConflictMask = conflictMask(in)
   val mshrConflictMaskFromA = conflictMaskFromA(in)
   dontTouch(mshrConflictMask)
@@ -170,7 +173,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def noFreeWay(task: TaskBundle): Bool = noFreeWayForSet(task.set)
 
   // flow not allowed when full, or entries might starve
-  val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in)
+  val canFlow =flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in)
+
   val doFlow  = canFlow && io.out.ready
   io.hasLatePF := latePrefetch(in) && io.in.valid && !sameAddr(in, RegNext(in))
   io.hasMergeA := mergeA && io.in.valid && !sameAddr(in, RegNext(in))
@@ -282,7 +286,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // we cancel req in chosenQ, with the entry still held in buffer to issue later
 //  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, io.in.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
   val cancel = !buffer(chosenQ.io.deq.bits.id).rdy
-
+  // printf("[Debug] cancel: %b, buffer(chosenQ.io.deq.bits.id).rdy: %b, chosenQ.io.deq.bits.id: %d\n", cancel, buffer(chosenQ.io.deq.bits.id).rdy, chosenQ.io.deq.bits.id)
   chosenQ.io.deq.ready := io.out.ready || cancel
   io.out.valid := chosenQValid && !cancel || io.in.valid && canFlow
   io.out.bits  := Mux(canFlow, io.in.bits, chosenQ.io.deq.bits.bits.task)

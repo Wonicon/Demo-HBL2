@@ -106,6 +106,7 @@ trait HasCoupledL2Parameters {
   def hasPrefetchBit = prefetchers.exists(_.hasPrefetchBit) // !! TODO.test this
   def hasPrefetchSrc = prefetchers.exists(_.hasPrefetchSrc)
   def topDownOpt = if(cacheParams.elaboratedTopDown) Some(true) else None
+  def enableMCP2 = cacheParams.enableMCP2
 
   def enableHintGuidedGrant = true
 
@@ -118,7 +119,7 @@ trait HasCoupledL2Parameters {
   def clientBits = edgeIn.client.clients.count(_.supports.probe)
   def sourceIdBits = edgeIn.bundle.sourceBits // ids of L1
   def msgSizeBits = edgeIn.bundle.sizeBits
-  def sourceIdAll = 1 << sourceIdBits
+  def sourceIdAll = 1 << sourceIdBits //FIXME Maybe Bug
 
   def hartIdLen: Int = p(MaxHartIdBits)
 
@@ -322,6 +323,9 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
     //  val l2_hint = Valid(UInt(32.W))
+      // DecoupledIO(new MatrixDataBundle())
+      val matrixDataOut512L2 = Vec(banks, DecoupledIO(new MatrixDataBundle()))
+      // val matrixDataOut512L2 = Output(Vec(banks, UInt(512.W)))// 生成banks的UInt(256.W)
       val l2_hint = ValidIO(new L2ToL1Hint())
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
       val debugTopDown = new Bundle {
@@ -416,7 +420,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
 
     val slices = node.in.zip(node.out).zipWithIndex.map {
       case (((in, edgeIn), (out, edgeOut)), i) =>
-        require(in.params.dataBits == out.params.dataBits)
+        require(in.params.dataBits == out.params.dataBits,s"in.params.dataBits${in.params.dataBits}!=out.params.dataBits${out.params.dataBits}")
         val rst_L2 = reset
         val slice = withReset(rst_L2) {
           if (enableCHI) {
@@ -451,6 +455,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         }
         in.b.bits.address := restoreAddress(slice.io.in.b.bits.address, i)
         slice.io.sliceId := i.U
+        io.matrixDataOut512L2(i) <> slice.io.matrixDataOut
 
         slice.io.error.ready := enableECC.asBool // TODO: fix the datapath as optional
 

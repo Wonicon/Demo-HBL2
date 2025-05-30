@@ -215,7 +215,15 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
    // toTLBundleD(deqTask, deqData(0).data, deqId)
     toTLBundleD(deqTask, Mux(deqTask.isKeyword.getOrElse(false.B),deqData(1).data,deqData(0).data), deqId)
   )
-
+  when(io.d.valid&&io.d.bits.opcode ===AccessAck){
+    // printf(s"TODO: Put AccessAck GrantBuffer\n")
+  }
+  // io.d.bits := Mux(
+  //   grantBufValid,
+  //   toTLBundleD(grantBuf.task, grantBuf.data.data, grantBuf.grantid),
+  //  // toTLBundleD(deqTask, deqData(0).data, deqId)
+  //   toTLBundleD(deqTask, Mux(deqTask.isKeyword.getOrElse(false.B),deqData(1).data,deqData(0).data), deqId)
+  // )
 
   XSPerfAccumulate("toTLBundleD_valid", deqValid)
   XSPerfAccumulate("toTLBundleD_valid_isKeyword", deqValid && deqTask.isKeyword.getOrElse(false.B))
@@ -328,12 +336,22 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   // =========== XSPerf ===========
   if (cacheParams.enablePerf) {
     val timers = RegInit(VecInit(Seq.fill(grantBufInflightSize){0.U(64.W)}))
-    inflightGrant zip timers map {
-      case (e, t) =>
-        when(e.valid) { t := t + 1.U }
-        when(RegNext(e.valid) && !e.valid) { t := 0.U }
-        assert(t < 10000.U, "Inflight Grant Leak")
+    val warningPrinted = RegInit(VecInit(Seq.fill(grantBufInflightSize)(false.B))) // 记录是否已经输出过警告
 
+    inflightGrant zip timers zip warningPrinted map {
+      case ((e, t),printed) =>
+        when(e.valid) { t := t + 1.U }
+        when(RegNext(e.valid) && !e.valid) {
+          t := 0.U
+          printed := false.B // 重置警告标志
+        }
+        // assert(t < 10000.U, "Inflight Grant Leak")
+        when(t >= 10000.U && !printed) {
+          // val tile=Wire(UInt(log2Ceil(blockBytes).W))
+          val address = Cat(e.bits.tag, e.bits.set)<<log2Ceil(blockBytes)
+          printf("Warning: Inflight Grant Leak detected! Timer value: %d ,0x%x\n", t, address)
+          printed := true.B // 重置警告标志
+        }
         val enable = RegNext(e.valid) && !e.valid
         XSPerfHistogram("grant_grantack_period", t, enable, 0, 12, 1)
         XSPerfMax("max_grant_grantack_period", t, enable)
