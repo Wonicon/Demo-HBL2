@@ -19,7 +19,7 @@ package coupledL2
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.util.SetAssocLRU
+import utility.mbist.MbistPipeline
 import coupledL2.utils._
 import utility.{ParallelPriorityMux, RegNextN, XSPerfAccumulate, Code, SRAMTemplate}
 import org.chipsalliance.cde.config.Parameters
@@ -75,6 +75,9 @@ class DirRead(implicit p: Parameters) extends L2Bundle {
   // dirRead when refill
   val refill = Bool()
   val mshrId = UInt(mshrBits.W)
+  // when flush l2
+  val cmoAll = Bool()
+  val cmoWay = UInt(wayBits.W)
 }
 
 class DirResult(implicit p: Parameters) extends L2Bundle {
@@ -128,11 +131,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     (has_invalid_way, way)
   }
 
-  def get_tag_from_encTag(encTag: UInt) = {
-    require((encTag.getWidth == encTagBits))
-    encTag(tagBits - 1, 0)
-  }
-
   val sets = cacheParams.sets
   val ways = cacheParams.ways
 
@@ -141,14 +139,23 @@ class Directory(implicit p: Parameters) extends L2Module {
   val replacerWen = WireInit(false.B)
 
   // val tagArray  = Module(new SRAMTemplate(UInt(tagBits.W), sets, ways, singlePort = true))
+  private val mbist = p(L2ParamKey).hasMbist
+  private val hasSramCtl = p(L2ParamKey).hasSramCtl
   val tagArray = if (enableTagECC) {
     Module(new SplittedSRAM(
-      gen = UInt((tagBits + eccTagBits).W),
+      gen = UInt((tagBankSplit * encTagBankBits).W),
       set = sets,
       way = ways,
       waySplit = 2,
+      dataSplit = if (enableTagSRAMSplit) {
+        tagSRAMSplit
+      } else {
+        1
+      },
       singlePort = true,
-      readMCP2 = false
+      readMCP2 = false,
+      hasMbist = mbist,
+      hasSramCtl = hasSramCtl
     ))
   } else {
     Module(new SplittedSRAM(
@@ -157,18 +164,17 @@ class Directory(implicit p: Parameters) extends L2Module {
       way = ways,
       waySplit = 2,
       singlePort = true,
-      readMCP2 = false
+      readMCP2 = false,
+      hasMbist = mbist,
+      hasSramCtl = hasSramCtl
     ))
   }
 
-  val metaArray = Module(new SRAMTemplate(new MetaEntry, sets, ways, singlePort = true))
+  val metaArray = Module(new SRAMTemplate(new MetaEntry, sets, ways, singlePort = true, hasMbist = mbist, hasSramCtl = hasSramCtl))
 
-  val tagRead = if (enableTagECC) {
-    Wire(Vec(ways, UInt((tagBits + eccTagBits).W)))
-  } else {
-    Wire(Vec(ways, UInt(tagBits.W)))
-  }
+  val tagRead_s3 = Wire(Vec(ways, UInt(tagBits.W)))
   val metaRead = Wire(Vec(ways, new MetaEntry()))
+  val errorRead = Wire(Vec(ways, Bool()))
 
   val resetFinish = RegInit(false.B)
   val resetIdx = RegInit((sets - 1).U)
@@ -177,7 +183,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   val repl = ReplacementPolicy.fromString(cacheParams.replacement, ways)
   val random_repl = cacheParams.replacement == "random"
   val replacer_sram_opt = if(random_repl) None else
-    Some(Module(new SRAMTemplate(UInt(repl.nBits.W), sets, 1, singlePort = true, shouldReset = true)))
+    Some(Module(new SRAMTemplate(UInt(repl.nBits.W), sets, 1, singlePort = true, shouldReset = true, hasMbist = mbist, hasSramCtl = hasSramCtl)))
 
   /* ====== Generate response signals ====== */
   // hit/way calculation in stage 3, Cuz SRAM latency is high under high frequency
@@ -195,17 +201,36 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   // Tag(ECC) R/W
   val tagWrite = if (enableTagECC) {
-    cacheParams.tagCode.encode(io.tagWReq.bits.wtag)
+    Cat(VecInit(Seq.tabulate(tagBankSplit)(i =>
+      io.tagWReq.bits.wtag(tagBankBits * (i + 1) - 1, tagBankBits * i))).map(tag => cacheParams.dataCode.encode(tag)))
   } else {
     io.tagWReq.bits.wtag
   }
-  tagRead := tagArray.io.r(io.read.fire, io.read.bits.set).resp.data
+  val tagRead = tagArray.io.r(io.read.fire, io.read.bits.set).resp.data
+  val bankTagRead = if (enableTagECC) {
+    tagRead.map(x =>
+      Cat(VecInit(Seq.tabulate(tagBankSplit)(i => x(encTagBankBits * (i + 1) - 1, encTagBankBits * i)(tagBankBits - 1, 0))))
+    )
+  } else {
+    tagRead
+  }
+  tagRead_s3 := bankTagRead
   tagArray.io.w(
     tagWen,
     tagWrite,
     io.tagWReq.bits.set,
     UIntToOH(io.tagWReq.bits.way)
   )
+
+  val bankTagError = if (enableTagECC) {
+    tagRead.map(x =>
+      VecInit(Seq.tabulate(tagBankSplit)(i => x(encTagBankBits * (i + 1) - 1, encTagBankBits * i))).
+        map(tag => cacheParams.dataCode.decode(tag).error).reduce(_ | _)
+    )
+  } else {
+    VecInit(Seq.fill(ways)(false.B))
+  }
+  errorRead := bankTagError
 
   // Meta R/W
   metaRead := metaArray.io.r(io.read.fire, io.read.bits.set).resp.data
@@ -217,7 +242,8 @@ class Directory(implicit p: Parameters) extends L2Module {
   )
 
   val metaAll_s3 = RegEnable(metaRead, 0.U.asTypeOf(metaRead), reqValid_s2)
-  val tagAll_s3 = RegEnable(tagRead, 0.U.asTypeOf(tagRead), reqValid_s2)
+  val tagAll_s3 = RegEnable(tagRead_s3, 0.U.asTypeOf(tagRead_s3), reqValid_s2)
+  val errorAll_s3 = RegEnable(errorRead, 0.U.asTypeOf(errorRead), reqValid_s2)
 
   val tagMatchVec = tagAll_s3.map(_ (tagBits - 1, 0) === req_s3.tag)
   val metaValidVec = metaAll_s3.map(_.state =/= MetaData.INVALID)
@@ -235,7 +261,7 @@ class Directory(implicit p: Parameters) extends L2Module {
       0.U(ways.W)
     )
   )).reduceTree(_ | _)
-  
+
   val freeWayMask_s3 = RegEnable(~occWayMask_s2, refillReqValid_s2)
   val refillRetry = !(freeWayMask_s3.orR)
 
@@ -257,15 +283,14 @@ class Directory(implicit p: Parameters) extends L2Module {
     chosenWay,
     PriorityEncoder(freeWayMask_s3)
   )
-
-  val hit_s3 = Cat(hitVec).orR
-  val way_s3 = Mux(hit_s3, hitWay, finalWay)
+  val hit_s3 = Cat(hitVec).orR || req_s3.cmoAll
+  val way_s3 = Mux(req_s3.cmoAll, req_s3.cmoWay, Mux(hit_s3, hitWay, finalWay))
   val meta_s3 = metaAll_s3(way_s3)
-  val tag_s3 = tagAll_s3(way_s3)(tagBits - 1, 0)
+  val tag_s3 = tagAll_s3(way_s3)
   val set_s3 = req_s3.set
   val replacerInfo_s3 = req_s3.replacerInfo
   val error_s3 = if (enableTagECC) {
-    cacheParams.tagCode.decode(tagAll_s3(way_s3)).error && reqValid_s3 && meta_s3.state =/= MetaData.INVALID
+    errorAll_s3(way_s3) && reqValid_s3 && !req_s3.cmoAll && meta_s3.state =/= MetaData.INVALID
   } else {
     false.B
   }
@@ -301,7 +326,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   replaceWay := repl.get_replace_way(repl_state_s3)
 
   io.replResp.valid := refillReqValid_s3
-  io.replResp.bits.tag := tagAll_s3(finalWay)(tagBits - 1, 0)
+  io.replResp.bits.tag := tagAll_s3(finalWay)
   io.replResp.bits.set := req_s3.set
   io.replResp.bits.way := finalWay
   io.replResp.bits.meta := metaAll_s3(finalWay)
@@ -326,7 +351,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   // hit-Promotion, miss-Insertion for RRIP
   // origin-bit marks whether the data_block is reused
   val origin_bit_opt = if(random_repl) None else
-    Some(Module(new SRAMTemplate(Bool(), sets, ways, singlePort = true, shouldReset = true)))
+    Some(Module(new SRAMTemplate(Bool(), sets, ways, singlePort = true, shouldReset = true, hasMbist = mbist, hasSramCtl = hasSramCtl)))
   val origin_bits_r = origin_bit_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data
   val origin_bits_hold = Wire(Vec(ways, Bool()))
   origin_bits_hold := HoldUnless(origin_bits_r, RegNext(io.read.fire, false.B))
@@ -346,7 +371,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     (!refillReqValid_s3 && req_s3.replacerInfo.channel(0) && req_s3.replacerInfo.opcode === Hint) || (req_s3.replacerInfo.channel(2) && metaAll_s3(way_s3).prefetch.getOrElse(false.B)) || (refillReqValid_s3 && req_s3.replacerInfo.refill_prefetch),
     req_s3.refill
   )
-
+  private val mbistPl = MbistPipeline.PlaceMbistPipeline(1, "L2Directory", mbist)
   if(cacheParams.replacement == "srrip"){
     val next_state_s3 = repl.get_next_state(repl_state_s3, way_s3, hit_s3, inv, rrip_req_type)
     val repl_init = Wire(Vec(ways, UInt(2.W)))
@@ -357,7 +382,7 @@ class Directory(implicit p: Parameters) extends L2Module {
       Mux(resetFinish, set_s3, resetIdx),
       1.U
     )
-    
+
   } else if(cacheParams.replacement == "drrip"){
     // Set Dueling
     val PSEL = RegInit(512.U(10.W)) //32-monitor sets, 10-bits psel
@@ -377,7 +402,7 @@ class Directory(implicit p: Parameters) extends L2Module {
        else if PSEL(MSB)==0: use srrip
        else if PSEL(MSB)==1: use brrip */
     val repl_type = WireInit(false.B)
-    repl_type := Mux(match_a, false.B, 
+    repl_type := Mux(match_a, false.B,
                     Mux(match_b, true.B,
                       Mux(PSEL(9)===0.U, false.B, true.B)))    // false.B - srrip, true.B - brrip
 

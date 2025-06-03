@@ -20,6 +20,7 @@ package coupledL2.tl2chi
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
+import utility._
 import coupledL2.L2Module
 
 class ChannelIO[+T <: Data](gen: T) extends Bundle {
@@ -130,8 +131,9 @@ object LinkState {
 
 class LCredit2Decoupled[T <: Bundle](
   gen: T,
-  lcreditNum: Int = 4 // the number of L-Credits that a receiver can provide
-) extends Module {
+  lcreditNum: Int = 4, // the number of L-Credits that a receiver can provide
+  blocking: Boolean = true
+)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle() {
     val in = Flipped(ChannelIO(gen.cloneType))
     val out = DecoupledIO(gen.cloneType)
@@ -141,19 +143,17 @@ class LCredit2Decoupled[T <: Bundle](
 
   require(lcreditNum <= 15)
 
-  val queue = Module(new Queue(gen.cloneType, entries = lcreditNum, pipe = true, flow = false))
-
   val state = io.state.state
   val enableLCredit = state === LinkStates.RUN
 
   val lcreditsWidth = log2Up(lcreditNum) + 1
   val lcreditInflight = RegInit(0.U(lcreditsWidth.W))
   val lcreditPool = RegInit(lcreditNum.U(lcreditsWidth.W))
+  val lcreditOut = Wire(Bool())
   assert(lcreditInflight + lcreditPool === lcreditNum.U)
-  val lcreditOut = (lcreditPool > queue.io.count) && enableLCredit
 
   val ready = lcreditInflight =/= 0.U
-  val accept = ready && io.in.flitv //&& RegNext(io.in.flitpend) -> TODO flitpend for LowPower
+  val accept = ready && io.in.flitv
 
   when (lcreditOut) {
     when (!accept) {
@@ -167,29 +167,69 @@ class LCredit2Decoupled[T <: Bundle](
     }
   }
 
-  queue.io.enq.valid := accept
-  // queue.io.enq.bits := io.in.bits
-  var lsb = 0
-  queue.io.enq.bits.getElements.reverse.foreach { case e =>
-    e := io.in.flit(lsb + e.asUInt.getWidth - 1, lsb).asTypeOf(e.cloneType)
-    lsb += e.asUInt.getWidth
-  }
-
-  assert(!accept || queue.io.enq.ready)
-
   io.in.lcrdv := RegNext(lcreditOut, init = false.B)
+  io.reclaimLCredit := lcreditInflight === 0.U
 
-  io.out <> queue.io.deq
-  val opcodeElements = queue.io.deq.bits.elements.filter(_._1 == "opcode")
-  require (opcodeElements.size == 1)
-  for ((_, opcode) <- opcodeElements) {
-    when (queue.io.deq.valid && opcode === 0.U) {
-      // This is a *LCrdReturn flit
-      queue.io.deq.ready := true.B
-      io.out.valid := false.B
+  /**
+    * performance counters
+    */
+  XSPerfHistogram("lcrd_inflight", lcreditInflight, true.B, 0, lcreditNum + 1)
+  XSPerfAccumulate("accept", accept)
+
+  if (blocking) {
+    val queue = Module(new Queue(gen.cloneType, entries = lcreditNum, pipe = true, flow = false))
+
+    lcreditOut := (lcreditPool > queue.io.count) && enableLCredit
+
+    queue.io.enq.valid := accept
+    // queue.io.enq.bits := io.in.bits
+    var lsb = 0
+    queue.io.enq.bits.getElements.reverse.foreach { case e =>
+      val elementWidth = e.asUInt.getWidth
+      if (elementWidth > 0) {
+        e := io.in.flit(lsb + elementWidth - 1, lsb).asTypeOf(e.cloneType)
+        lsb += elementWidth
+      }
+    }
+
+    assert(!accept || queue.io.enq.ready)
+
+    io.out <> queue.io.deq
+    val opcodeElements = queue.io.deq.bits.elements.filter(_._1 == "opcode")
+    require (opcodeElements.size == 1)
+    for ((_, opcode) <- opcodeElements) {
+      when (queue.io.deq.valid && opcode === 0.U) {
+        // This is a *LCrdReturn flit
+        queue.io.deq.ready := true.B
+        io.out.valid := false.B
+      }
+    }
+
+    QueuePerf(size = lcreditNum, utilization = queue.io.count, full = queue.io.count === lcreditNum.U)
+  } else {
+    val lcreditReturn = WireInit(false.B)
+    lcreditOut := (lcreditPool > 0.U) && enableLCredit
+
+    assert(!accept || io.out.ready)
+
+    io.out.valid := accept && !lcreditReturn
+    var lsb = 0
+    io.out.bits.getElements.reverse.foreach { case e =>
+      val elementWidth = e.asUInt.getWidth
+      if (elementWidth > 0) {
+        e := io.in.flit(lsb + elementWidth - 1, lsb).asTypeOf(e.cloneType)
+        lsb += elementWidth
+      }
+    }
+    val opcodeElements = io.out.bits.elements.filter(_._1 == "opcode")
+    require (opcodeElements.size == 1)
+    for ((_, opcode) <- opcodeElements) {
+      when (opcode === 0.U) {
+        // This is a *LCrdReturn flit
+        lcreditReturn := true.B
+      }
     }
   }
-  io.reclaimLCredit := lcreditInflight === 0.U
 }
 
 object LCredit2Decoupled {
@@ -201,9 +241,10 @@ object LCredit2Decoupled {
     state: LinkState,
     reclaimLCredit: Bool,
     suggestName: Option[String] = None,
-    lcreditNum: Int = defaultLCreditNum
-  ): Unit = {
-    val mod = Module(new LCredit2Decoupled(right.bits.cloneType, lcreditNum))
+    lcreditNum: Int = defaultLCreditNum,
+    blocking: Boolean = true
+  )(implicit p: Parameters): Unit = {
+    val mod = Module(new LCredit2Decoupled(right.bits.cloneType, lcreditNum, blocking))
     suggestName.foreach(name => mod.suggestName(s"LCredit2Decoupled_${name}"))
 
     mod.io.in <> left
@@ -213,7 +254,7 @@ object LCredit2Decoupled {
   }
 }
 
-class Decoupled2LCredit[T <: Bundle](gen: T) extends Module {
+class Decoupled2LCredit[T <: Bundle](gen: T)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle() {
     val in = Flipped(DecoupledIO(gen.cloneType))
     val out = ChannelIO(gen.cloneType)
@@ -251,6 +292,11 @@ class Decoupled2LCredit[T <: Bundle](gen: T) extends Module {
   out.flitpend := RegNext(true.B, init = false.B) // TODO
   out.flitv := RegNext(flitv, init = false.B)
   out.flit := RegEnable(Mux(io.in.valid, Cat(io.in.bits.getElements.map(_.asUInt)), 0.U /* LCrdReturn */), flitv)
+
+  /**
+    * performance counters
+    */
+  XSPerfAccumulate("lcrd_received", acceptLCredit)
 }
 
 object Decoupled2LCredit {
@@ -259,7 +305,7 @@ object Decoupled2LCredit {
     right: ChannelIO[T],
     state: LinkState,
     suggestName: Option[String] = None
-  ): Unit = {
+  )(implicit p: Parameters): Unit = {
     val mod = Module(new Decoupled2LCredit(left.bits.cloneType))
     suggestName.foreach(name => mod.suggestName(s"Decoupled2LCredit_${name}"))
     
@@ -274,6 +320,7 @@ class LinkMonitor(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val in = Flipped(new DecoupledPortIO())
     val out = new PortIO
     val nodeID = Input(UInt(NODEID_WIDTH.W))
+    val exitco = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
   })
   // val s_stop :: s_activate :: s_run :: s_deactivate :: Nil = Enum(4)
 
@@ -296,17 +343,21 @@ class LinkMonitor(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   Decoupled2LCredit(setSrcID(io.in.tx.rsp, io.nodeID), io.out.tx.rsp, LinkState(txState), Some("txrsp"))
   Decoupled2LCredit(setSrcID(io.in.tx.dat, io.nodeID), io.out.tx.dat, LinkState(txState), Some("txdat"))
   LCredit2Decoupled(io.out.rx.snp, io.in.rx.snp, LinkState(rxState), rxsnpDeact, Some("rxsnp"))
-  LCredit2Decoupled(io.out.rx.rsp, io.in.rx.rsp, LinkState(rxState), rxrspDeact, Some("rxrsp"))
-  LCredit2Decoupled(io.out.rx.dat, io.in.rx.dat, LinkState(rxState), rxdatDeact, Some("rxdat"))
+  LCredit2Decoupled(io.out.rx.rsp, io.in.rx.rsp, LinkState(rxState), rxrspDeact, Some("rxrsp"), 15, false)
+  LCredit2Decoupled(io.out.rx.dat, io.in.rx.dat, LinkState(rxState), rxdatDeact, Some("rxdat"), 15, false)
 
-  io.out.txsactive := true.B
-  io.out.tx.linkactivereq := RegNext(true.B, init = false.B)
+  //exit coherecy + deactive tx/rx when l2 flush done
+  val exitco = io.exitco.getOrElse(false.B)
+  val exitcoDone = !io.out.syscoreq & !io.out.syscoack
+
+  io.out.tx.linkactivereq := RegNext(!exitco, init = false.B)
   io.out.rx.linkactiveack := RegNext(
     next = RegNext(io.out.rx.linkactivereq) || !rxDeact,
     init = false.B
   )
 
-  io.out.syscoreq := true.B
+  io.out.syscoreq := RegNext(!exitco, init = false.B)
+  io.out.txsactive := RegNext(!exitcoDone, init = false.B)
 
   val retryAckCnt = RegInit(0.U(64.W))
   val pCrdGrantCnt = RegInit(0.U(64.W))

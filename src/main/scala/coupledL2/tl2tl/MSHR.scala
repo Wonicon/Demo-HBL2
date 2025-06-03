@@ -196,6 +196,7 @@ class MSHR(implicit p: Parameters) extends L2Module {
     // mp_release definitely read releaseBuf and refillBuf at ReqArb
     // and it needs to write refillData to DS, so useProbeData is set false according to DS.wdata logic
     mp_release.useProbeData := false.B
+    mp_release.readProbeDataDown := mp_release.opcode === ReleaseData
     mp_release.mshrRetry := false.B
     mp_release.way := dirResult.way
     mp_release.fromL2pft.foreach(_ := false.B)
@@ -245,6 +246,7 @@ class MSHR(implicit p: Parameters) extends L2Module {
     mp_probeack.mshrId := io.id
     mp_probeack.aliasTask.foreach(_ := false.B)
     mp_probeack.useProbeData := true.B // write [probeAckData] to DS, if not probed toN
+    mp_probeack.readProbeDataDown := mp_probeack.opcode === ProbeAckData
     mp_probeack.mshrRetry := false.B
     mp_probeack.way := dirResult.way
     mp_probeack.fromL2pft.foreach(_ := false.B)
@@ -329,6 +331,7 @@ class MSHR(implicit p: Parameters) extends L2Module {
       (req.aliasTask.getOrElse(false.B) && 
         !(dirResult.meta.state === BRANCH && req_needT) 
       )
+    mp_grant.readProbeDataDown := false.B
     mp_grant.dirty := false.B
 
     mp_grant.meta := MetaEntry(
@@ -457,7 +460,6 @@ class MSHR(implicit p: Parameters) extends L2Module {
       state.w_rprobeacklast := state.w_rprobeacklast || c_resp.bits.last
       state.w_pprobeackfirst := true.B
       state.w_pprobeacklast := state.w_pprobeacklast || c_resp.bits.last
-      state.w_pprobeack := state.w_pprobeack || req.off === 0.U || c_resp.bits.last
     }
     when (c_resp.bits.opcode === ProbeAckData) {
       probeDirty := true.B
@@ -539,7 +541,7 @@ class MSHR(implicit p: Parameters) extends L2Module {
   io.status.bits.metaTag := dirResult.tag
   io.status.bits.needsRepl := releaseNotSent
   // wait for resps, high as valid
-  io.status.bits.w_c_resp := !state.w_rprobeacklast || !state.w_pprobeacklast || !state.w_pprobeack
+  io.status.bits.w_c_resp := !state.w_rprobeacklast || !state.w_pprobeacklast
   io.status.bits.w_d_resp := !state.w_grantlast || !state.w_grant || !state.w_releaseack
   io.status.bits.will_free := will_free
   io.status.bits.is_miss := !dirResult.hit
@@ -564,13 +566,15 @@ class MSHR(implicit p: Parameters) extends L2Module {
   io.msInfo.bits.w_grantfirst := state.w_grantfirst
   io.msInfo.bits.s_refill := state.s_refill
   io.msInfo.bits.s_release := state.s_release
-  io.msInfo.bits.s_cmoresp := false.B
+  io.msInfo.bits.s_cmoresp := true.B
+  io.msInfo.bits.s_cmometaw := true.B
   io.msInfo.bits.w_releaseack := state.w_releaseack
   io.msInfo.bits.w_replResp := state.w_replResp
   io.msInfo.bits.w_rprobeacklast := state.w_rprobeacklast
   io.msInfo.bits.replaceData := mp_release.opcode === ReleaseData
-  io.msInfo.bits.releaseToB := false.B
-  io.msInfo.bits.metaState := meta.state
+  io.msInfo.bits.releaseToClean := false.B
+  io.msInfo.bits.meta := meta
+  io.msInfo.bits.meta.dirty := meta.dirty || probeDirty
   io.msInfo.bits.channel := req.channel
 
   assert(!(c_resp.valid && !io.status.bits.w_c_resp))
