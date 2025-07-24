@@ -112,6 +112,10 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
 
     /* ECC error*/
     val error = ValidIO(new L2CacheErrorInfo)
+
+    /* l2 flush (CMO All) */
+    val cmoAllBlock = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
+    val cmoLineDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
   })
 
   require(chiOpt.isDefined)
@@ -145,10 +149,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val dirResult_s3    = io.dirResp_s3
   val meta_s3         = dirResult_s3.meta
   val req_s3          = task_s3.bits
-
-  val tagError_s3     = io.dirResp_s3.error || meta_s3.tagErr
-  val dataError_s3    = meta_s3.dataErr
-  val l2Error_s3      = io.dirResp_s3.error
+  val cmoHitInvalid   = io.cmoAllBlock.getOrElse(false.B) && (meta_s3.state === INVALID)
 
   val mshr_req_s3     = req_s3.mshrTask
   val sink_req_s3     = !mshr_req_s3
@@ -161,7 +162,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val req_prefetch_s3           = sinkA_req_s3 && req_s3.opcode === Hint
   val req_get_s3                = sinkA_req_s3 && req_s3.opcode === Get
   val req_cbo_clean_s3          = sinkA_req_s3 && req_s3.opcode === CBOClean
-  val req_cbo_flush_s3          = sinkA_req_s3 && req_s3.opcode === CBOFlush
+  val req_cbo_flush_s3          = sinkA_req_s3 && req_s3.opcode === CBOFlush && !cmoHitInvalid
   val req_cbo_inval_s3          = sinkA_req_s3 && req_s3.opcode === CBOInval
 
   val mshr_grant_s3             = mshr_req_s3 && req_s3.fromA && (req_s3.opcode === Grant || req_s3.opcode === GrantData)
@@ -182,6 +183,9 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
 
   val mshr_writeCleanFull_s3    = mshr_req_s3 && req_s3.toTXREQ && req_s3.chiOpcode.get === WriteCleanFull
   val mshr_writeBackFull_s3     = mshr_req_s3 && req_s3.toTXREQ && req_s3.chiOpcode.get === WriteBackFull
+  val mshr_writeEvictFull_s3    = mshr_req_s3 && req_s3.toTXREQ && req_s3.chiOpcode.get === WriteEvictFull
+  val mshr_writeEvictOrEvict_s3 = mshr_req_s3 && req_s3.toTXREQ &&
+    afterIssueEbOrElse(req_s3.chiOpcode.get === WriteEvictOrEvict, false.B)
   val mshr_evict_s3             = mshr_req_s3 && req_s3.toTXREQ && req_s3.chiOpcode.get === Evict
   
   val mshr_cbWrData_s3          = mshr_req_s3 && req_s3.toTXDAT && req_s3.chiOpcode.get === CopyBackWrData
@@ -195,6 +199,26 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val cache_alias               = req_acquire_s3 && dirResult_s3.hit && meta_s3.clients(0) &&
                               meta_s3.alias.getOrElse(0.U) =/= req_s3.alias.getOrElse(0.U)
 
+  // *NOTICE: 'nestable_*' must not be used in A Channel related logics.
+  val nestable_dirResult_s3     = Wire(chiselTypeOf(dirResult_s3))
+  val nestable_meta_s3          = nestable_dirResult_s3.meta
+  val nestable_meta_has_clients_s3 = nestable_dirResult_s3.meta.clients.orR
+  nestable_dirResult_s3 := dirResult_s3
+  when (req_s3.snpHitRelease) {
+    // Meta states from MSHRs were considered as directory result here.
+    // Therefore, meta states were always inferred to be hit when nesting release, no matter the fact that directory
+    // was always non-hit on cache replacement subsequent release.
+    nestable_dirResult_s3.hit   := req_s3.snpHitReleaseMeta.state =/= INVALID
+    nestable_dirResult_s3.meta  := req_s3.snpHitReleaseMeta
+    nestable_dirResult_s3.set   := req_s3.set
+    nestable_dirResult_s3.tag   := req_s3.tag
+  }
+
+  val tagError_s3               = io.dirResp_s3.error || meta_s3.tagErr
+  val dataError_s3              = meta_s3.dataErr
+  val l2TagError_s3             = io.dirResp_s3.error
+  val l2Error_s3                = io.dirResp_s3.error || mshr_req_s3 && req_s3.dataCheckErr.getOrElse(false.B)
+
   val mshr_refill_s3 = mshr_accessackdata_s3 || mshr_hintack_s3 || mshr_grant_s3 // needs refill to L2 DS
   val replResp_valid_s3 = io.replResp.valid
   val replResp_valid_s4 = RegNext(io.replResp.valid, init = false.B)
@@ -203,6 +227,8 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val need_repl = replResp_valid_hold && io.replResp.bits.meta.state =/= INVALID && req_s3.replTask
 
   /* ======== Interact with MSHR ======== */
+  // *NOTICE: A Channel requests should be blocked by RequestBuffer when MSHR nestable,
+  //          'nestable_*' must not be used here.
   val acquire_on_miss_s3 = req_acquire_s3 || req_prefetch_s3 || req_get_s3
   val acquire_on_hit_s3 = meta_s3.state === BRANCH && req_needT_s3 && !req_prefetch_s3
   val need_acquire_s3_a = req_s3.fromA && (Mux(
@@ -227,9 +253,9 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val need_mshr_s3_a = need_acquire_s3_a || need_probe_s3_a || cache_alias
   
   /**
-    * 1. For SnpOnce/SnpOnceFwd, only the latest copy of the cacheline is needed without changing the state of the
-    *    cacheline at the snoopee. Therefore L2 should only send pProbe toT (to get the latest copy) when the state
-    *    in L2 is TRUNK
+    * 1. For SnpOnce/SnpOnceFwd, SnpQuery, and SnpStash, only the latest copy of the cacheline is needed without changing
+    *    the state of the cacheline at the snoopee. Therefore L2 should only send pProbe toT (to get the latest copy)
+    *    when the state in L2 is TRUNK
     * 2. For SnpClean/SnpCleanFwd, SnpShared/SnpSharedFwd, SnpNotSharedDirty/SnpNotSharedDirtyFwd, and SnpCleanShared,
     *    the snooped cacheline should be degraded into BRANCH state because there is no SharedDirty state or Owner
     *    state (of MOESI) in CoupledL2. Therefore L2 should only send pProbe toB to degrade upper clients when the
@@ -237,15 +263,16 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     * 3. For SnpUnique/SnpUniqueFwd/SnpUniqueStash, SnpCleanInvalid, SnpMakeInvalid/SnpMakeInvalidStash, the snooped
     *    cacheline should be degraded into INVALID state. Therefore L2 should only send pProbe toN to degrade upper
     *    clients when the state in L2 is TRUNK or BRANCH with clients.orR = 1
-    * 
+    * 4. When tagErr(NDERR), never forward data, and the snoopee should invalidate cache state
+    *
     */
   // whether L2 should do forwarding or not
   val expectFwd = isSnpXFwd(req_s3.chiOpcode.get)
-  val canFwd = dirResult_s3.hit
+  val canFwd = nestable_dirResult_s3.hit && !(nestable_dirResult_s3.meta.tagErr || nestable_dirResult_s3.error)
   val doFwd = expectFwd && canFwd
-  val doFwdHitRelease = expectFwd && req_s3.snpHitRelease && req_s3.snpHitReleaseWithData
-  val need_pprobe_s3_b_snpOnceX = req_s3.fromB && isSnpOnceX(req_s3.chiOpcode.get) &&
-    dirResult_s3.hit && meta_s3.state === TRUNK && meta_has_clients_s3
+  val need_pprobe_s3_b_snpStable = req_s3.fromB && (
+    isSnpOnceX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get)
+  ) && dirResult_s3.hit && meta_s3.state === TRUNK && meta_has_clients_s3
   val need_pprobe_s3_b_snpToB = req_s3.fromB && (
     isSnpToB(req_s3.chiOpcode.get) ||
     req_s3.chiOpcode.get === SnpCleanShared
@@ -255,8 +282,9 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     req_s3.chiOpcode.get === SnpCleanInvalid ||
     isSnpMakeInvalidX(req_s3.chiOpcode.get)
   ) && dirResult_s3.hit && meta_has_clients_s3
-  val need_pprobe_s3_b = need_pprobe_s3_b_snpOnceX || need_pprobe_s3_b_snpToB || need_pprobe_s3_b_snpToN
-  val need_dct_s3_b = doFwd || doFwdHitRelease // DCT
+  val need_pprobe_s3_b_snpNDERR = req_s3.fromB && tagError_s3 && dirResult_s3.hit
+  val need_pprobe_s3_b = need_pprobe_s3_b_snpStable || need_pprobe_s3_b_snpToB || need_pprobe_s3_b_snpToN || need_pprobe_s3_b_snpNDERR
+  val need_dct_s3_b = doFwd // DCT
   val need_mshr_s3_b = need_pprobe_s3_b || need_dct_s3_b
 
   val need_mshr_s3 = need_mshr_s3_a || need_mshr_s3_b
@@ -265,7 +293,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val alloc_state = WireInit(0.U.asTypeOf(new FSMState()))
   alloc_state.elements.foreach(_._2 := true.B)
   io.toMSHRCtl.mshr_alloc_s3.valid := task_s3.valid && !mshr_req_s3 && need_mshr_s3
-  io.toMSHRCtl.mshr_alloc_s3.bits.dirResult := dirResult_s3
+  io.toMSHRCtl.mshr_alloc_s3.bits.dirResult := nestable_dirResult_s3
   io.toMSHRCtl.mshr_alloc_s3.bits.state := alloc_state
   io.toMSHRCtl.mshr_alloc_s3.bits.task match { case task =>
     task := req_s3
@@ -284,54 +312,96 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val retToSrc = req_s3.retToSrc.getOrElse(false.B)
   val neverRespData = isSnpMakeInvalidX(req_s3.chiOpcode.get) ||
     isSnpStashX(req_s3.chiOpcode.get) ||
+    isSnpQuery(req_s3.chiOpcode.get) ||
     req_s3.chiOpcode.get === SnpOnceFwd ||
     req_s3.chiOpcode.get === SnpUniqueFwd
-  val shouldRespData_dirty = dirResult_s3.hit && (meta_s3.state === TIP || meta_s3.state === TRUNK) && meta_s3.dirty
+  val shouldRespData_dirty = nestable_dirResult_s3.hit && 
+    (nestable_meta_s3.state === TIP || nestable_meta_s3.state === TRUNK) && nestable_meta_s3.dirty
+  // For SnpOnce, always response data under UC when L1 was BRANCH
+  val shouldRespData_once =  nestable_dirResult_s3.hit && 
+    nestable_meta_s3.state === TIP && !nestable_meta_s3.dirty &&
+    req_s3.chiOpcode.get === SnpOnce
   // For forwarding snoops, if the RetToSrc value is 1, must return a copy is the cache line is Dirty or Clean.
-  val shouldRespData_retToSrc_fwd = dirResult_s3.hit && retToSrc && isSnpXFwd(req_s3.chiOpcode.get)
+  val shouldRespData_retToSrc_fwd = nestable_dirResult_s3.hit && retToSrc && isSnpXFwd(req_s3.chiOpcode.get)
   // For non-forwarding snoops, ig the RetToSrc value is 1, must return a copy if the cache line is Shared Clean and
   // snoopee retains a copy of the cache line.
-  val shouldRespData_retToSrc_nonFwd = dirResult_s3.hit && retToSrc && meta_s3.state === BRANCH && (
+  val shouldRespData_retToSrc_nonFwd = nestable_dirResult_s3.hit && retToSrc && nestable_meta_s3.state === BRANCH && (
     req_s3.chiOpcode.get === SnpOnce ||
     req_s3.chiOpcode.get === SnpUnique ||
     isSnpToBNonFwd(req_s3.chiOpcode.get)
   )
-  val shouldRespData = shouldRespData_dirty || shouldRespData_retToSrc_fwd || shouldRespData_retToSrc_nonFwd
+  val shouldRespData = shouldRespData_dirty || shouldRespData_once || shouldRespData_retToSrc_fwd || shouldRespData_retToSrc_nonFwd
   val doRespData = shouldRespData && !neverRespData
-  val doRespDataHitRelease = req_s3.snpHitRelease && req_s3.snpHitReleaseWithData && !neverRespData
   dontTouch(doRespData)
   dontTouch(shouldRespData)
   dontTouch(neverRespData)
   
+  // On directory hit under non-invalidating snoop nesting WriteCleanFull, 
+  // excluding SnpStashX and SnpQuery:
+  //  1. SnpCleanShared[1-sink_resp]  : UD -> UC_PD, UC -> UC, SC -> SC
+  //  2. SnpOnce*[2-sink_resp]        : UD -> SC_PD, UC -> SC, SC -> SC
+  //  3. snpToB                       : UD -> SC_PD, UC -> SC, SC -> SC
+  // 
+  // *NOTE[1-sink_resp]:
+  //    UD -> SC transitions were not used on WriteCleanFull without nesting snoop, and
+  //    only UD -> UC update could be observed on directory in this case
+  //    Therefore, it was unnecessary to observe cache state from nested WriteCleanFull MSHRs, while
+  //    extracting PassDirty from MSHRs
+  //
+  // *NOTE[2-sink_resp]:
+  //    UD -> UC transitions were not allowed on SnpOnce*, while permitting UD -> UD and UC -> UC
+  //    On SnpOnce*, UD/UC were turned into SC on nested WriteClean, on which directory must hit
+  //    Otherwise, the cache state was fast forwarded to I by default
+  //    Directory might be missing after multiple nesting snoops on WriteClean, indicating losing UD
+  //
+  // *NOTE[tagErr/NDERR]:
+  //    ALL -> I, snoopee invalidates local copy
+  //
   // Resp[2: 0] = {PassDirty, CacheState[1: 0]}
   val respCacheState = WireInit(I)
-  val respPassDirty = dirResult_s3.hit && meta_s3.state === TIP && meta_s3.dirty &&
-    !(neverRespData || req_s3.chiOpcode.get === SnpOnce)
-  when (dirResult_s3.hit) {
+  val respPassDirty = doRespData && nestable_dirResult_s3.hit && isT(nestable_meta_s3.state) && nestable_meta_s3.dirty &&
+    (req_s3.chiOpcode.get =/= SnpOnce || req_s3.snpHitRelease) &&
+    !(isSnpStashX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get))
+
+  when (nestable_dirResult_s3.hit && !tagError_s3) {
     when (isSnpToB(req_s3.chiOpcode.get)) {
-      respCacheState := SC
+      respCacheState := Mux(req_s3.snpHitReleaseToInval, I, SC)
     }
-    when (isSnpOnceX(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get)) {
+    when (isSnpOnceX(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get)) {
+      /**
+      * NOTICE: On Stash and Query:
+      * the cache state must maintain unchanged on nested copy-back writes
+      */
       respCacheState := Mux(
-        meta_s3.state === BRANCH,
+        nestable_meta_s3.state === BRANCH,
         SC,
-        Mux(meta_s3.dirty, UD, UC)
+        Mux(nestable_meta_s3.dirty, UD, UC)
       )
     }
+    when (isSnpOnceX(req_s3.chiOpcode.get)) {
+      // On SnpOnce/SnpOnceFwd nesting WriteCleanFull, turn UD to SC
+      when (req_s3.snpHitReleaseToClean && nestable_meta_s3.dirty) {
+        respCacheState := SC
+      }
+      // On SnpOnce/SnpOnceFwd nesting WriteBack*/WriteEvict*, turn UD to I
+      when (req_s3.snpHitReleaseToInval) {
+        respCacheState := I
+      }
+    }
     when (req_s3.chiOpcode.get === SnpCleanShared) {
-      respCacheState := Mux(meta_s3.state === BRANCH, SC, UC)
+      respCacheState := Mux(isT(nestable_meta_s3.state), UC, SC)
     }
   }
 
   // FwdState[2: 0] = {PassDirty, CacheState[1: 0]}
   val fwdCacheState = WireInit(I)
   val fwdPassDirty = WireInit(false.B)
-  when (dirResult_s3.hit) {
+  when (nestable_dirResult_s3.hit) {
     when (isSnpToBFwd(req_s3.chiOpcode.get)) {
-      fwdCacheState := SC
+      fwdCacheState := Mux(req_s3.snpHitReleaseToInval, I, SC)
     }
     when (req_s3.chiOpcode.get === SnpUniqueFwd) {
-      when (meta_s3.state === TIP && meta_s3.dirty) {
+      when (nestable_meta_s3.state === TIP && nestable_meta_s3.dirty) {
         fwdCacheState := UD
         fwdPassDirty := true.B
       }.otherwise {
@@ -339,6 +409,9 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
       }
     }
   }
+
+  val sink_resp_s3_b_meta = MetaEntry()
+  val sink_resp_s3_b_metaWen = Wire(Bool())
 
   sink_resp_s3.valid := task_s3.valid && !mshr_req_s3 && !need_mshr_s3
   sink_resp_s3.bits := task_s3.bits
@@ -361,7 +434,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     sink_resp_s3.bits.dbID.foreach(_ := 0.U)
     sink_resp_s3.bits.pCrdType.foreach(_ := 0.U) // TODO
     sink_resp_s3.bits.chiOpcode.foreach(_ := MuxLookup(
-      Cat(doFwd || doFwdHitRelease, doRespData || doRespDataHitRelease),
+      Cat(doFwd, doRespData),
       SnpResp
     )(Seq(
       Cat(false.B, false.B) -> SnpResp,
@@ -369,18 +442,12 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
       Cat(false.B, true.B)  -> SnpRespData, // ignore SnpRespDataPtl for now
       Cat(true.B, true.B)   -> SnpRespDataFwded
     )))
-    sink_resp_s3.bits.resp.foreach(_ := Mux(
-      req_s3.snpHitRelease && !isSnpStashX(req_s3.chiOpcode.get),
-      setPD(I, req_s3.snpHitReleaseWithData && !isSnpMakeInvalidX(req_s3.chiOpcode.get)),
-      setPD(respCacheState, respPassDirty && (doRespData || doRespDataHitRelease))
-    ))
+    sink_resp_s3.bits.resp.foreach(_ := setPD(respCacheState, respPassDirty && doRespData))
     sink_resp_s3.bits.fwdState.foreach(_ := setPD(fwdCacheState, fwdPassDirty))
-    sink_resp_s3.bits.txChannel := Cat(
-      doRespData || doRespDataHitRelease,
-      !(doRespData || doRespDataHitRelease),
-      false.B
-    ) // TODO: parameterize this
+    sink_resp_s3.bits.txChannel := Cat(doRespData, !doRespData, false.B) // TODO: parameterize this
     sink_resp_s3.bits.size := log2Ceil(blockBytes).U
+    sink_resp_s3.bits.meta := sink_resp_s3_b_meta
+    sink_resp_s3.bits.metaWen := sink_resp_s3_b_metaWen
 
   }.otherwise { // req_s3.fromC
     sink_resp_s3.bits.opcode := ReleaseAck
@@ -399,15 +466,16 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val hasData_s3 = hasData_s3_tl || hasData_s3_chi
 
   val need_data_a = dirResult_s3.hit && (req_get_s3 || req_acquireBlock_s3)
-  val need_data_b = sinkB_req_s3 && (doRespData || doFwd || dirResult_s3.hit && meta_s3.state === TRUNK)
+  val need_data_b = sinkB_req_s3 && (doRespData || doFwd || nestable_dirResult_s3.hit && nestable_meta_s3.state === TRUNK)
   val need_data_mshr_repl = mshr_refill_s3 && need_repl && !retry
-  val need_data_cmo = cmo_cbo_s3 && dirResult_s3.hit && meta_s3.dirty
+  val need_data_cmo = cmo_cbo_s3 && nestable_dirResult_s3.hit && nestable_meta_s3.dirty
   val ren = need_data_a || need_data_b || need_data_mshr_repl || need_data_cmo
 
   val wen_c = sinkC_req_s3 && isParamFromT(req_s3.param) && req_s3.opcode(0) && dirResult_s3.hit
   val wen_mshr = req_s3.dsWen && (
     mshr_snpRespX_s3 || mshr_snpRespDataX_s3 ||
-    mshr_writeCleanFull_s3 || mshr_writeBackFull_s3 || mshr_evict_s3 ||
+    mshr_writeCleanFull_s3 || mshr_writeBackFull_s3 || 
+    mshr_writeEvictFull_s3 || mshr_writeEvictOrEvict_s3 || mshr_evict_s3 ||
     mshr_refill_s3 && !need_repl && !retry
   )
   val wen = wen_c || wen_mshr
@@ -456,9 +524,14 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val need_write_refillBuf = false.B
 
   /* ======== Write Directory ======== */
+  // B, C: Requests from Channel B (RXSNP) and Channel C would only downgrade permission,
+  //       so there is no need to use 'nestable_*'.
   val metaW_valid_s3_a = sinkA_req_s3 && !need_mshr_s3_a && !req_get_s3 && !req_prefetch_s3 && !cmo_cbo_s3 // get & prefetch that hit will not write meta
+  // Also write directory on:
+  //  1. SnpOnce nesting WriteCleanFull under UD (SnpOnceFwd always needs MSHR) for UD -> SC
   val metaW_valid_s3_b = sinkB_req_s3 && !need_mshr_s3_b && dirResult_s3.hit &&
-    !isSnpOnceX(req_s3.chiOpcode.get) && !isSnpStashX(req_s3.chiOpcode.get) && (
+    (!isSnpOnce(req_s3.chiOpcode.get) || (req_s3.snpHitReleaseToClean && req_s3.snpHitReleaseMeta.dirty)) && 
+    !isSnpStashX(req_s3.chiOpcode.get) && !isSnpQuery(req_s3.chiOpcode.get) && (
       meta_s3.state === TIP || meta_s3.state === BRANCH && isSnpToN(req_s3.chiOpcode.get)
     )
   val metaW_valid_s3_c = sinkC_req_s3 && dirResult_s3.hit
@@ -474,7 +547,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val metaW_s3_a = MetaEntry(
     dirty = meta_s3.dirty,
     state = Mux(req_needT_s3 || sink_resp_s3_a_promoteT, TRUNK, meta_s3.state),
-    clients = Fill(clientBits, true.B),
+    clients = Fill(clientBits, Mux(l2TagError_s3, false.B, true.B)),
     alias = Some(metaW_s3_a_alias),
     accessed = true.B,
     tagErr = meta_s3.tagErr,
@@ -531,6 +604,9 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   io.tagWReq.bits.way := Mux(mshr_refill_s3 && req_s3.replTask, io.replResp.bits.way, req_s3.way)
   io.tagWReq.bits.wtag := req_s3.tag
 
+  sink_resp_s3_b_metaWen := metaW_valid_s3_b
+  sink_resp_s3_b_meta := metaW_s3_b
+
   /* ======== Interact with Channels (SourceD/TXREQ/TXRSP/TXDAT) ======== */
   val chnl_fire_s3 = d_s3.fire || txreq_s3.fire || txrsp_s3.fire || txdat_s3.fire
   val req_drop_s3 = !need_write_releaseBuf && (
@@ -550,12 +626,12 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val txdat_s3_latch = true
   val isD_s3 = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 || mshr_refill_s3 && !retry,
-    req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint
+    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry,
+    req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !io.cmoAllBlock.getOrElse(false.B)
   )
   val isD_s3_ready = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 || mshr_refill_s3 && !retry,
+    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry,
     req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !d_s3_latch.B
   )
   val isTXRSP_s3 = Mux(
@@ -566,14 +642,17 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   val isTXDAT_s3 = Mux(
     mshr_req_s3,
     mshr_snpRespDataX_s3 || mshr_cbWrData_s3 || mshr_dct_s3,
-    req_s3.fromB && !need_mshr_s3 && (doRespDataHitRelease || doRespData && !data_unready_s3)
+    req_s3.fromB && !need_mshr_s3 && 
+      (doRespData && (!data_unready_s3 || req_s3.snpHitRelease && req_s3.snpHitReleaseWithData))
   )
   val isTXDAT_s3_ready = Mux(
     mshr_req_s3,
     mshr_snpRespDataX_s3 || mshr_cbWrData_s3 || mshr_dct_s3,
-    req_s3.fromB && !need_mshr_s3 && (doRespDataHitRelease || doRespData && !data_unready_s3) && !txdat_s3_latch.B
+    req_s3.fromB && !need_mshr_s3 && !txdat_s3_latch.B &&
+      (doRespData && (!data_unready_s3 || req_s3.snpHitRelease && req_s3.snpHitReleaseWithData))
   )
-  val isTXREQ_s3 = mshr_req_s3 && (mshr_writeBackFull_s3 || mshr_writeCleanFull_s3 || mshr_evict_s3)
+  val isTXREQ_s3 = mshr_req_s3 && (mshr_writeBackFull_s3 || mshr_writeCleanFull_s3 || 
+     mshr_writeEvictFull_s3 || mshr_writeEvictOrEvict_s3 || mshr_evict_s3)
 
   txreq_s3.valid := task_s3.valid && isTXREQ_s3
   txrsp_s3.valid := task_s3.valid && isTXRSP_s3
@@ -596,17 +675,26 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   // This serves as VALID signal
   // c_set_dirty is true iff Release has Data
   io.nestedwb.c_set_dirty := task_s3.valid && task_s3.bits.fromC && task_s3.bits.opcode === ReleaseData && task_s3.bits.param === TtoN
+  io.nestedwb.c_set_tip := task_s3.valid && task_s3.bits.fromC && task_s3.bits.opcode === Release && task_s3.bits.param === TtoN
   /**
     * Snoop nesting happens when:
     * 1. snoop nests a copy-back request
     * 2. snoop nests a Read/MakeUnique request
+    * 
+    * *NOTICE: Never allow 'b_inv_dirty' on SnpStash*, SnpQuery and other future snoops that would
+    *          leave cache line state untouched.
+    *          Never allow 'b_inv_dirty' on SnpOnce* nesting WriteCleanFull, which would end with SC.
     */
-  io.nestedwb.b_inv_dirty := task_s3.valid && task_s3.bits.fromB && source_req_s3.snpHitRelease
+  io.nestedwb.b_inv_dirty := task_s3.valid && task_s3.bits.fromB && source_req_s3.snpHitReleaseToInval &&
+    !(isSnpStashX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get))
   io.nestedwb.b_toB.foreach(_ :=
     task_s3.valid && task_s3.bits.fromB && source_req_s3.metaWen && source_req_s3.meta.state === BRANCH
   )
   io.nestedwb.b_toN.foreach(_ :=
     task_s3.valid && task_s3.bits.fromB && source_req_s3.metaWen && source_req_s3.meta.state === INVALID
+  )
+  io.nestedwb.b_toClean.foreach(_ :=
+    task_s3.valid && task_s3.bits.fromB && source_req_s3.metaWen && !source_req_s3.meta.dirty
   )
 
   io.nestedwbData := c_releaseData_s3.asTypeOf(new DSBlock)
@@ -760,6 +848,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   d_s5.bits.data.data := out_data_s5
   txreq_s5.bits := task_s5.bits.toCHIREQBundle()
   txrsp_s5.bits := task_s5.bits
+  txrsp_s5.bits.denied := tagError_s5
   txdat_s5.bits.task := task_s5.bits
   txdat_s5.bits.task.denied := tagError_s5
   txdat_s5.bits.task.corrupt := task_s5.bits.corrupt || dataError_s5
@@ -829,14 +918,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     status.bits.channel := task.bits.channel
     // To optimize timing, we restrict the blocking condition of TXRSP and TXDAT.
     // This may be inaccurate, but it works.
-    status.bits.txChannel := Cat(
-      // TXDAT
-      !neverRespData,
-      // TXRSP
-      !doRespDataHitRelease,
-      // TXREQ
-      task.bits.toTXREQ
-    )
+    status.bits.txChannel := task.bits.txChannel
     status.bits.mshrTask := task.bits.mshrTask
   }
 
@@ -849,7 +931,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     // need Acquire downwards
     when (need_acquire_s3_a) {
       alloc_state.s_acquire := false.B
-      alloc_state.s_compack.get := !need_compack_s3_a
+      alloc_state.s_rcompack.get := !need_compack_s3_a
       alloc_state.w_grantfirst := false.B
       alloc_state.w_grantlast := false.B
       alloc_state.w_grant := false.B
@@ -879,7 +961,6 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
       alloc_state.s_pprobe := false.B
       alloc_state.w_pprobeackfirst := false.B
       alloc_state.w_pprobeacklast := false.B
-      alloc_state.w_pprobeack := false.B
     }
     // need forwarding response
     when (need_dct_s3_b) {
@@ -901,7 +982,24 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   io.error.bits.valid := l2Error_s5 // if not enableECC, should be false
   io.error.bits.address := Cat(task_s5.bits.tag, task_s5.bits.set, task_s5.bits.off)
 
+  /* CMO All Flush cacheline done if:
+   cacheline is INVALID -> drop @s3
+   cacheline is VALID send back resp when mshr complete CBOFlush flow with mshr_comresp_s3 @s3
+   */
+  val cmoLineDrop = task_s3.valid && sinkA_req_s3 && req_s3.opcode === CBOFlush && cmoHitInvalid
+  val cmoLineDone = io.cmoAllBlock.getOrElse(false.B) && task_s3.valid && mshr_cmoresp_s3
+  io.cmoLineDone.foreach { _ := RegNextN(cmoLineDone || cmoLineDrop, 2, Some(false.B)) }
+
   /* ===== Performance counters ===== */
+  // SinkA requests
+  XSPerfAccumulate("acquireBlock", task_s3.valid && sinkA_req_s3 && req_s3.opcode === AcquireBlock)
+  XSPerfAccumulate("acquirePerm", task_s3.valid && sinkA_req_s3 && req_s3.opcode === AcquirePerm)
+  XSPerfAccumulate("prefetch", task_s3.valid && req_prefetch_s3)
+  XSPerfAccumulate("get", task_s3.valid && req_get_s3)
+  XSPerfAccumulate("cbo_clean", task_s3.valid && req_cbo_clean_s3)
+  XSPerfAccumulate("cbo_flush", task_s3.valid && req_cbo_flush_s3)
+  XSPerfAccumulate("cbo_inval", task_s3.valid && req_cbo_inval_s3)
+
   // num of mshr req
   XSPerfAccumulate("mshr_grant_req", task_s3.valid && mshr_grant_s3 && !retry)
   XSPerfAccumulate("mshr_grantdata_req", task_s3.valid && mshr_grantdata_s3 && !retry)
@@ -916,9 +1014,10 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
   XSPerfAccumulate("mshr_snpRespDataPtl_req", task_s3.valid && mshr_snpRespDataPtl_s3)
   XSPerfAccumulate("mshr_snpRespDataFwded_req", task_s3.valid && mshr_snpRespDataFwded_s3)
   XSPerfAccumulate("mshr_writeBackFull", task_s3.valid && mshr_writeBackFull_s3)
+  XSPerfAccumulate("mshr_writeEvictFull", task_s3.valid && mshr_writeEvictFull_s3)
+  XSPerfAccumulate("mshr_writeEvictOrEvict", task_s3.valid && mshr_writeEvictOrEvict_s3)
   XSPerfAccumulate("mshr_evict_s3", task_s3.valid && mshr_evict_s3)
   
-
   // directory access result
   val hit_s3 = task_s3.valid && !mshr_req_s3 && dirResult_s3.hit
   val miss_s3 = task_s3.valid && !mshr_req_s3 && !dirResult_s3.hit
@@ -933,6 +1032,16 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     (req_s3.opcode === AcquireBlock || req_s3.opcode === AcquirePerm))
   XSPerfAccumulate("get_miss", miss_s3 && req_s3.fromA && req_s3.opcode === Get)
 
+  XSPerfAccumulate("a_need_acquire_on_hit", task_s3.valid && req_s3.fromA && dirResult_s3.hit && acquire_on_hit_s3)
+  XSPerfAccumulate("a_need_acquire_on_miss", task_s3.valid && req_s3.fromA && !dirResult_s3.hit && acquire_on_miss_s3)
+  XSPerfAccumulate("get_need_probe", task_s3.valid && need_probe_s3_a && req_get_s3)
+  XSPerfAccumulate("acquire_need_probe_alias", task_s3.valid && cache_alias)
+
+  XSPerfAccumulate("b_need_probe_snpStable", task_s3.valid && need_pprobe_s3_b_snpStable)
+  XSPerfAccumulate("b_need_probe_snpToB", task_s3.valid && need_pprobe_s3_b_snpToB)
+  XSPerfAccumulate("b_need_probe_snpToN", task_s3.valid && need_pprobe_s3_b_snpToN)
+  XSPerfAccumulate("b_need_dct", task_s3.valid && need_dct_s3_b)
+
   XSPerfAccumulate("b_req_hit", hit_s3 && req_s3.fromB)
   XSPerfAccumulate("b_req_miss", miss_s3 && req_s3.fromB)
 
@@ -942,6 +1051,16 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     enable = hit_s3 && req_s3.fromA, start = 0, stop = cacheParams.ways, step = 1)
   XSPerfHistogram("a_req_miss_way_choice", perfCnt = dirResult_s3.way,
     enable = miss_s3 && req_s3.fromA, start = 0, stop = cacheParams.ways, step = 1)
+  
+  XSPerfHistogram("a_req_access_set", perfCnt = task_s3.bits.set,
+    enable = task_s3.valid && !mshr_req_s3 && req_s3.fromA,
+    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
+  XSPerfHistogram("a_req_hit_set", perfCnt = task_s3.bits.set,
+    enable = hit_s3 && req_s3.fromA,
+    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
+  XSPerfHistogram("a_req_miss_set", perfCnt = task_s3.bits.set,
+    enable = miss_s3 && req_s3.fromA,
+    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
 
   // pipeline stages for TX and sourceD reqs
   val pipe_len = Seq(5.U, 4.U, 3.U)

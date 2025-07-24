@@ -113,7 +113,7 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
   val isBackTypeMM = req.user.lift(MemBackTypeMM).getOrElse(false.B)
   val isPageTypeNC = req.user.lift(MemPageTypeNC).getOrElse(false.B)
 
-  val wordBits = io.req.bits.data.getWidth // 64
+  require(io.req.bits.data.getWidth == wordBits)
   val wordBytes = wordBits / 8
   val words = DATA_WIDTH / wordBits
   val wordIdxBits = log2Ceil(words)
@@ -157,8 +157,23 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
     rdata := rxdat.bits.data
     val nderr = rxdat.bits.respErr === RespErrEncodings.NDERR
     val derr = rxdat.bits.respErr === RespErrEncodings.DERR
+    val dataCheck = if (enableDataCheck) {
+      dataCheckMethod match {
+        case 1 => (0 until DATACHECK_WIDTH).map(i =>
+          rxdat.bits.dataCheck.get(i) ^ rxdat.bits.data(8 * (i + 1) - 1, 8 * i).xorR ^ true.B).reduce(_ | _)
+        case 2 =>
+          val code = new SECDEDCode
+          (0 until DATACHECK_WIDTH).map(i =>
+            code.decode(Cat(rxdat.bits.dataCheck.get(i) ^ rxdat.bits.data(8 * (i + 1) - 1, 8 * i))).error).reduce(_ | _)
+        case _ => false.B
+      }
+    } else {
+      false.B
+    }
+    val poison = rxdat.bits.poison.getOrElse(false.B).orR
+    assert(!dataCheck, "UC should not have DataCheck error")
     denied := denied || nderr
-    corrupt := corrupt || derr || nderr
+    corrupt := corrupt || derr || nderr || dataCheck || poison
   }
   when (io.resp.fire) {
     s_resp := true.B
@@ -169,7 +184,7 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
     }
     when (
       rxrsp.bits.opcode === CompDBIDResp || rxrsp.bits.opcode === DBIDResp ||
-      ENABLE_ISSUE_Eb.B && rxrsp.bits.opcode === DBIDRespOrd
+      afterIssueEbOrElse(rxrsp.bits.opcode === DBIDRespOrd, false.B)
     ) {
       w_dbidresp := true.B
       srcID := rxrsp.bits.srcID
@@ -177,7 +192,7 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
       traceTag := rxrsp.bits.traceTag
     }
     when (rxrsp.bits.opcode === CompDBIDResp || rxrsp.bits.opcode === Comp) {
-      denied := denied || rxrsp.bits.respErr === RespErrEncodings.NDERR
+      denied := denied || rxrsp.bits.respErr === RespErrEncodings.NDERR || rxrsp.bits.respErr === RespErrEncodings.DERR
       // TODO: d_corrupt is reserved and must be 0 in TileLink
     }
     when (rxrsp.bits.opcode === RetryAck) {
@@ -213,6 +228,7 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
   ))
   txreq.bits.size := req.size
   txreq.bits.addr := req.address
+  txreq.bits.ns := enableNS.B
   txreq.bits.allowRetry := allowRetry
   txreq.bits.pCrdType := Mux(allowRetry, 0.U, pCrdType)
   txreq.bits.expCompAck := false.B
@@ -241,6 +257,7 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
     device = !isBackTypeMM,
     ewa = if (bufferableNC) (isPageTypeNC || isBackTypeMM) else false.B
   )
+  txreq.bits.mpam.foreach(_ := MPAM(txreq.bits.ns))
 
   io.resp.valid := !s_resp && Mux(isRead, w_compdata, w_comp && w_dbidresp && s_ncbwrdata)
   io.resp.bits.opcode := Mux(isRead, AccessAckData, AccessAck)
@@ -269,6 +286,30 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
   txdat.bits.data := Fill(words, req.data) & FillInterleaved(8, txdat.bits.be)
   txdat.bits.traceTag := traceTag
 
+  val txdata = txdat.bits.data
+  val dataCheck = if (enableDataCheck) {
+    dataCheckMethod match {
+      case 1 => VecInit((0 until DATACHECK_WIDTH).map(i => txdata(8 * (i + 1) - 1, 8 * i).xorR ^ true.B)).asUInt
+      case 2 =>
+        val code = new SECDEDCode
+        VecInit((0 until DATACHECK_WIDTH).map(i => code.encode(txdata(8 * (i + 1) - 1, 8 * i)))).asUInt
+      case _ => 0.U(DATACHECK_WIDTH.W)
+    }
+  } else {
+    DontCare
+  }
+  txdat.bits.respErr := Mux(req.corrupt, RespErrEncodings.DERR, RespErrEncodings.OK)
+  txdat.bits.dataCheck match {
+    case Some(x) =>
+      x := dataCheck
+    case None =>
+  }
+  txdat.bits.poison match {
+    case Some(x) =>
+      x := Fill(POISON_WIDTH, req.corrupt)
+    case None =>
+  }
+
   rxrsp.ready := (!w_comp || !w_dbidresp || !w_readreceipt.getOrElse(true.B)) && s_txreq
   rxdat.ready := !w_compdata && s_txreq
 
@@ -277,6 +318,21 @@ class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Mo
   io.pCrd.query.bits.srcID := srcID
 
   io.waitOnReadReceipt.foreach(_ := !w_readreceipt.get && s_txreq)
+
+  /**
+    * performance counters
+    */
+  XSPerfAccumulate("mmio_get", io.req.fire && io.req.bits.opcode === Get)
+  XSPerfAccumulate("mmio_put", io.req.fire && (io.req.bits.opcode === PutFullData || io.req.bits.opcode === PutPartialData))
+  XSPerfAccumulate("mmio_wait_compdata", !w_compdata)
+  XSPerfAccumulate("mmio_wait_readreceipt", !w_readreceipt.getOrElse(true.B))
+  XSPerfAccumulate("mmio_wait_comp", !w_comp)
+  XSPerfAccumulate("mmio_wait_dbid", !w_dbidresp)
+  XSPerfAccumulate("mmio_txreq_nack", txreq.valid && !txreq.ready)
+  XSPerfAccumulate("mmio_read_retry", rxrsp.fire && rxrsp.bits.opcode === RetryAck && isRead)
+  XSPerfAccumulate("mmio_write_retry", rxrsp.fire && rxrsp.bits.opcode === RetryAck && !isRead)
+  XSPerfAccumulate("mmio_read_wait_pcrd", !w_pcrdgrant && isRead)
+  XSPerfAccumulate("mmio_write_wait_pcrd", !w_pcrdgrant && !isRead)  
 }
 
 class MMIOBridgeImp(outer: MMIOBridge) extends LazyModuleImp(outer)
@@ -320,7 +376,7 @@ class MMIOBridgeImp(outer: MMIOBridge) extends LazyModuleImp(outer)
     entry.io.id := i.U
   }
 
-  val txreqArb = Module(new Arbiter(chiselTypeOf(io.tx.req.bits), mmioBridgeSize))
+  val txreqArb = Module(new RRArbiterInit(chiselTypeOf(io.tx.req.bits), mmioBridgeSize))
   for ((a, req) <- txreqArb.io.in.zip(entries.map(_.io.chi.tx.req))) {
     a <> req
     val isReadNoSnp = req.bits.opcode === ReadNoSnp

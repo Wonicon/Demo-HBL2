@@ -1,9 +1,10 @@
 package coupledL2
 
 import chisel3._
+import circt.stage.ChiselStage
 import chisel3.util._
 import org.chipsalliance.cde.config._
-import chisel3.stage.{ChiselGeneratorAnnotation, ChiselStage}
+import chisel3.stage.ChiselGeneratorAnnotation
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
@@ -80,6 +81,7 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1)(imp
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
       here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+      XSPerfLevel.withName("VERBOSE"),
       i
     )
   }))))
@@ -166,6 +168,7 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1)(imp
       dontTouch(l2.module.io)
 
       l2.module.io.hartId := i.U
+      l2.module.io.pfCtrlFromCore := DontCare
       l2.module.io_nodeID := io(i).nodeId
       l2.module.io.debugTopDown := DontCare
       l2.module.io.l2_tlb_req <> DontCare
@@ -199,6 +202,16 @@ object TestTopCHIHelper {
         // prefetch
         prefetch            = Seq(BOPParameters()),
 
+        // data check
+        dataCheck           = Some("oddparity"),
+        enablePoison        = true,
+
+        // internal ECC
+        tagECC              = Some("secded"),
+        dataECC             = Some("secded"),
+        enableTagECC        = true,
+        enableDataECC       = true,
+
         // using external RN-F SAM
         sam                 = Seq(AddressSet.everything -> 0)
       )
@@ -211,9 +224,9 @@ object TestTopCHIHelper {
 
     val top = DisableMonitors(p => LazyModule(fTop(p)))(config)
 
-    (new ChiselStage).execute(args, Seq(
-      ChiselGeneratorAnnotation(() => top.module)
-    ))
+    (new ChiselStage).execute(args,
+      ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+    )
 
     ChiselDB.addToFileRegisters
     FileRegisters.write("./build")
@@ -242,7 +255,7 @@ Usage: TestTop_CHIL2 [<--option> <values>]
     System.exit(-1)
   }
 
-  var varArgs = ArrayBuffer(args:_*)
+  var varArgs = ArrayBuffer(args.toIndexedSeq:_*)
   var varArgsDropped = 0
 
   var numCores: Int = 2
@@ -269,7 +282,7 @@ Usage: TestTop_CHIL2 [<--option> <values>]
     varArgs.remove(i - varArgsDropped, 2)
     varArgsDropped = varArgsDropped + 2
   })
-  varArgs.trimToSize
+  varArgs.trimToSize()
 
   TestTopCHIHelper.gen(
     p => new TestTop_CHIL2(

@@ -41,17 +41,18 @@ class RXDAT(implicit p: Parameters) extends TL2CHIL2Module {
   val dataCheck = if (enableDataCheck) {
     dataCheckMethod match {
       case 1 => (0 until DATACHECK_WIDTH).map(i =>
-        io.out.bits.dataCheck(i) ^ io.out.bits.data(8 * (i + 1) - 1, 8 * i).xorR).reduce(_ | _)
+        io.out.bits.dataCheck.get(i) ^ io.out.bits.data(8 * (i + 1) - 1, 8 * i).xorR ^ true.B).reduce(_ | _)
       case 2 =>
         val code = new SECDEDCode
         (0 until DATACHECK_WIDTH).map(i =>
-          code.decode(Cat(io.out.bits.dataCheck(i) ^ io.out.bits.data(8 * (i + 1) - 1, 8 * i))).error).reduce(_ | _)
+          code.decode(Cat(io.out.bits.dataCheck.get(i) ^ io.out.bits.data(8 * (i + 1) - 1, 8 * i))).error).reduce(_ | _)
       case _ => false.B
     }
   } else {
     false.B
   }
-  val poison = io.out.bits.poision.orR
+  val poison = io.out.bits.poison.getOrElse(false.B).orR
+  assert(!(dataCheck && io.out.valid), "RXDAT(cached) should not have DataCheck error")
 
   /* Write Refill Buffer*/
   io.refillBufWrite.valid := io.out.valid
@@ -65,21 +66,23 @@ class RXDAT(implicit p: Parameters) extends TL2CHIL2Module {
   io.in.set := 0.U(setBits.W)
   io.in.tag := 0.U(tagBits.W)
 
-  io.in.respInfo.opcode        := DontCare
-  io.in.respInfo.param         := DontCare
-  io.in.respInfo.last          := last
-  io.in.respInfo.dirty         := DontCare
-  io.in.respInfo.isHit         := DontCare
-  io.in.respInfo.chiOpcode.get := io.out.bits.opcode
-  io.in.respInfo.txnID.get     := io.out.bits.txnID
-  io.in.respInfo.srcID.get     := io.out.bits.srcID
-  io.in.respInfo.homeNID.get   := io.out.bits.homeNID
-  io.in.respInfo.dbID.get      := io.out.bits.dbID
-  io.in.respInfo.resp.get      := io.out.bits.resp
-  io.in.respInfo.pCrdType.get  := DontCare // RXDAT Channel does not have a pCrdType field
-  io.in.respInfo.respErr.get   := io.out.bits.respErr
-  io.in.respInfo.traceTag.get  := io.out.bits.traceTag
-  io.in.respInfo.corrupt       := io.out.bits.respErr === RespErrEncodings.DERR || io.out.bits.respErr === RespErrEncodings.NDERR || dataCheck || poison
+  io.in.respInfo.opcode           := DontCare
+  io.in.respInfo.param            := DontCare
+  io.in.respInfo.last             := last
+  io.in.respInfo.dirty            := DontCare
+  io.in.respInfo.isHit            := DontCare
+  io.in.respInfo.chiOpcode.get    := io.out.bits.opcode
+  io.in.respInfo.txnID.get        := io.out.bits.txnID
+  io.in.respInfo.srcID.get        := io.out.bits.srcID
+  io.in.respInfo.homeNID.get      := io.out.bits.homeNID
+  io.in.respInfo.dbID.get         := io.out.bits.dbID
+  io.in.respInfo.resp.get         := io.out.bits.resp
+  io.in.respInfo.pCrdType.get     := DontCare // RXDAT Channel does not have a pCrdType field
+  io.in.respInfo.respErr.get      := io.out.bits.respErr
+  io.in.respInfo.traceTag.get     := io.out.bits.traceTag
+  io.in.respInfo.denied           := io.out.bits.respErr === RespErrEncodings.NDERR
+  io.in.respInfo.corrupt          := io.out.bits.respErr === RespErrEncodings.DERR || io.out.bits.respErr === RespErrEncodings.NDERR || dataCheck || poison
+  io.in.respInfo.dataCheckErr.get := dataCheck
 
   io.out.ready := true.B
 

@@ -1,9 +1,10 @@
 package coupledL2
 
 import chisel3._
+import circt.stage.{ChiselStage, FirtoolOption}
 import chisel3.util._
 import org.chipsalliance.cde.config._
-import chisel3.stage.{ChiselGeneratorAnnotation, ChiselStage}
+import chisel3.stage.ChiselGeneratorAnnotation
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
@@ -78,6 +79,7 @@ class TestTop_L2()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
       here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   }))))
@@ -112,6 +114,7 @@ class TestTop_L2()(implicit p: Parameters) extends LazyModule {
     }
 
     l2.module.io.hartId := DontCare
+    l2.module.io.pfCtrlFromCore := DontCare
     l2.module.io.debugTopDown <> DontCare
     l2.module.io.l2_tlb_req <> DontCare
   }
@@ -194,6 +197,7 @@ class TestTop_L2L3()(implicit p: Parameters) extends LazyModule {
       enableTagECC = true,
       enableDataECC = true,
       dataCheck = Some("oddparity"),
+      enablePoison = true,
     )
     // case huancun.BankBitsKey => log2Ceil(8)
     case BankBitsKey => log2Ceil(l2_banks)
@@ -205,6 +209,7 @@ class TestTop_L2L3()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
       here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   })))
@@ -235,6 +240,7 @@ class TestTop_L2L3()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(HCCacheParamsKey).enablePerf && !here(HCCacheParamsKey).FPGAPlatform,
       false,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   })))
@@ -282,6 +288,7 @@ class TestTop_L2L3()(implicit p: Parameters) extends LazyModule {
     }
 
     l2.module.io.hartId := DontCare
+    l2.module.io.pfCtrlFromCore := DontCare
     l2.module.io.debugTopDown <> DontCare
     l2.module.io.l2_tlb_req <> DontCare
   }
@@ -356,6 +363,7 @@ class TestTop_L2_Standalone()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
       here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   })))
@@ -389,6 +397,7 @@ class TestTop_L2_Standalone()(implicit p: Parameters) extends LazyModule {
     }
     l3.makeIOs()(ValName(s"slave_port"))
     l2.module.io.hartId := DontCare
+    l2.module.io.pfCtrlFromCore := DontCare
     l2.module.io.debugTopDown <> DontCare
     l2.module.io.l2_tlb_req <> DontCare
   }
@@ -445,6 +454,7 @@ class TestTop_L2L3L2()(implicit p: Parameters) extends LazyModule {
       enableTagECC = true,
       enableDataECC = true,
       dataCheck = Some("oddparity"),
+      enablePoison = true,
     )
     case BankBitsKey => 0
     case LogUtilsOptionsKey => LogUtilsOptions(
@@ -455,6 +465,7 @@ class TestTop_L2L3L2()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
       here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+      XSPerfLevel.withName("VERBOSE"),
       i
     )
   }))))
@@ -486,6 +497,7 @@ class TestTop_L2L3L2()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(HCCacheParamsKey).enablePerf && !here(HCCacheParamsKey).FPGAPlatform,
       false,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   })))
@@ -528,6 +540,7 @@ class TestTop_L2L3L2()(implicit p: Parameters) extends LazyModule {
       case l2 => {
         l2.module.io.debugTopDown <> DontCare
         l2.module.io.hartId := DontCare
+        l2.module.io.pfCtrlFromCore := DontCare
         l2.module.io.l2_tlb_req <> DontCare
       }
     }
@@ -608,6 +621,7 @@ class TestTop_fullSys()(implicit p: Parameters) extends LazyModule {
         enableTagECC = true,
         enableDataECC = true,
         dataCheck = Some("oddparity"),
+        enablePoison = true,
       )
       case BankBitsKey => 0
       case LogUtilsOptionsKey => LogUtilsOptions(
@@ -618,6 +632,7 @@ class TestTop_fullSys()(implicit p: Parameters) extends LazyModule {
       case PerfCounterOptionsKey => PerfCounterOptions(
         here(L2ParamKey).enablePerf && !here(L2ParamKey).FPGAPlatform,
         here(L2ParamKey).enableRollingDB && !here(L2ParamKey).FPGAPlatform,
+        XSPerfLevel.withName("VERBOSE"),
         i
       )
     })))
@@ -629,6 +644,7 @@ class TestTop_fullSys()(implicit p: Parameters) extends LazyModule {
 
     InModuleBody {
       l2.module.io.hartId := DontCare
+      l2.module.io.pfCtrlFromCore := DontCare
     }
   }
 
@@ -658,6 +674,7 @@ class TestTop_fullSys()(implicit p: Parameters) extends LazyModule {
     case PerfCounterOptionsKey => PerfCounterOptions(
       here(HCCacheParamsKey).enablePerf && !here(HCCacheParamsKey).FPGAPlatform,
       false,
+      XSPerfLevel.withName("VERBOSE"),
       0
     )
   })))
@@ -687,6 +704,15 @@ class TestTop_fullSys()(implicit p: Parameters) extends LazyModule {
   }
 }
 
+private[coupledL2] object TestTopFirtoolOptions {
+  def apply() = Seq(
+    FirtoolOption("--disable-annotation-unknown"),
+    FirtoolOption("--repl-seq-mem"),
+    FirtoolOption("--repl-seq-mem-file=TestTop.sv.conf"),
+    FirtoolOption("--lowering-options=explicitBitcast")
+  )
+}
+
 object TestTop_L2 extends App {
   val config = baseConfig(1).alterPartial({
     case L2ParamKey => L2Param(
@@ -697,9 +723,9 @@ object TestTop_L2 extends App {
   ChiselDB.init(false)
 
   val top = DisableMonitors(p => LazyModule(new TestTop_L2()(p)) )(config)
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => top.module)
-  ))
+  (new ChiselStage).execute(args,
+    ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+  )
 
   ChiselDB.addToFileRegisters
   FileRegisters.write("./build")
@@ -715,9 +741,9 @@ object TestTop_L2_Standalone extends App {
   ChiselDB.init(false)
 
   val top = DisableMonitors(p => LazyModule(new TestTop_L2_Standalone()(p)) )(config)
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => top.module)
-  ))
+  (new ChiselStage).execute(args,
+    ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+  )
 
   ChiselDB.addToFileRegisters
   FileRegisters.write("./build")
@@ -737,9 +763,9 @@ object TestTop_L2L3 extends App {
   Constantin.init(false)
 
   val top = DisableMonitors(p => LazyModule(new TestTop_L2L3()(p)) )(config)
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => top.module)
-  ))
+  (new ChiselStage).execute(args,
+    ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+  )
 
   ChiselDB.addToFileRegisters
   Constantin.addToFileRegisters
@@ -760,9 +786,9 @@ object TestTop_L2L3L2 extends App {
   Constantin.init(false)
 
   val top = DisableMonitors(p => LazyModule(new TestTop_L2L3L2()(p)))(config)
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => top.module)
-  ))
+  (new ChiselStage).execute(args,
+    ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+  )
 
   ChiselDB.addToFileRegisters
   Constantin.addToFileRegisters
@@ -782,9 +808,9 @@ object TestTop_fullSys extends App {
   ChiselDB.init(false)
 
   val top = DisableMonitors(p => LazyModule(new TestTop_fullSys()(p)))(config)
-  (new ChiselStage).execute(args, Seq(
-    ChiselGeneratorAnnotation(() => top.module)
-  ))
+  (new ChiselStage).execute(args,
+    ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
+  )
 
   ChiselDB.addToFileRegisters
   FileRegisters.write("./build")

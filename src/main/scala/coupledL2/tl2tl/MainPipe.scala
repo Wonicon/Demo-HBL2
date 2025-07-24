@@ -222,6 +222,7 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
   ms_task.mshrId           := 0.U(mshrBits.W)
   ms_task.aliasTask.foreach(_ := cache_alias)
   ms_task.useProbeData     := false.B
+  ms_task.readProbeDataDown := false.B
   ms_task.mshrRetry        := false.B
   ms_task.fromL2pft.foreach(_ := req_s3.fromL2pft.get)
   ms_task.needHint.foreach(_  := req_s3.needHint.get)
@@ -240,12 +241,14 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
   ms_task.txChannel        := 0.U
   ms_task.matrixTask := req_s3.matrixTask
   ms_task.snpHitRelease    := false.B
-  ms_task.snpHitReleaseToB := false.B
+  ms_task.snpHitReleaseToInval := false.B
+  ms_task.snpHitReleaseToClean := false.B
   ms_task.snpHitReleaseWithData := false.B
   ms_task.snpHitReleaseIdx := 0.U
+  ms_task.snpHitReleaseMeta := MetaEntry()
   ms_task.denied           := false.B
   ms_task.corrupt          := false.B
-
+  ms_task.cmoAll           := false.B
   /* ======== Resps to SinkA/B/C Reqs ======== */
   val sink_resp_s3 = WireInit(0.U.asTypeOf(Valid(new TaskBundle))) // resp for sinkA/B/C request that does not need to alloc mshr
   val sink_resp_s3_a_promoteT = dirResult_s3.hit && isT(meta_s3.state)
@@ -438,6 +441,7 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
   // This serves as VALID signal
   // c_set_dirty is true iff Release has Data
   io.nestedwb.c_set_dirty := task_s3.valid && task_s3.bits.fromC && task_s3.bits.opcode === ReleaseData
+  io.nestedwb.c_set_tip := false.B
   io.nestedwb.b_inv_dirty := false.B
 
   io.nestedwbData := c_releaseData_s3.asTypeOf(new DSBlock)
@@ -662,7 +666,6 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
     alloc_state.s_pprobe := false.B
     alloc_state.w_pprobeackfirst := false.B
     alloc_state.w_pprobeacklast := false.B
-    alloc_state.w_pprobeack := false.B
     alloc_state.s_probeack := false.B
   }
 

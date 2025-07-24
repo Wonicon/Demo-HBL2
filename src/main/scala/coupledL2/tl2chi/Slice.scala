@@ -19,7 +19,7 @@ package coupledL2.tl2chi
 
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tilelink._
+import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
 import coupledL2._
 import coupledL2.prefetch.PrefetchIO
@@ -59,7 +59,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val mainPipe = Module(new MainPipe())
   val reqBuf = Module(new RequestBuffer())
   val mshrCtl = Module(new MSHRCtl())
-
+  private val mbistPl = MbistPipeline.PlaceMbistPipeline(2, "L2Slice", p(L2ParamKey).hasMbist)
   sinkC.io.msInfo := mshrCtl.io.msInfo
 
   grantBuf.io.d_task <> mainPipe.io.toSourceD
@@ -186,6 +186,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
       io.latePF.get := reqBuf.io.hasLatePF
     }
   )
+  io.l2Miss := mshrCtl.io.l2Miss
 
   /* Connect upwards channels */
   val inBuf = cacheParams.innerBuf
@@ -201,8 +202,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   sinkC.io.c <> inBuf.c(io.in.c)
   io.in.d <> inBuf.d(grantBuf.io.d)
   grantBuf.io.e <> inBuf.e(io.in.e)
-  io.error.valid := mainPipe.io.error.valid
-  io.error.bits := mainPipe.io.error.bits
+  io.error.valid := RegNext(mainPipe.io.error.valid, false.B)
+  io.error.bits := RegNext(mainPipe.io.error.bits)
 
   /* Connect downwards channels */
   io.out.tx.req <> txreq.io.out
@@ -213,6 +214,14 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   rxrsp.io.out <> io.out.rx.rsp
 
   io_pCrd <> mshrCtl.io.pCrd
+
+  /* Connect l2 flush All channel */ 
+  sinkA.io.cmoAll.foreach {cmoAll => cmoAll.cmoLineDone := mainPipe.io.cmoLineDone.getOrElse(false.B)}
+  sinkA.io.cmoAll.foreach {cmoAll => cmoAll.mshrValid := VecInit(mshrCtl.io.msInfo.map(m => m.valid)).reduce(_|_)}
+  sinkA.io.cmoAll.foreach {cmoAll => cmoAll.l2Flush := io.l2Flush.getOrElse(false.B)}
+  mainPipe.io.cmoAllBlock.foreach {_ := sinkA.io.cmoAll.map(_.cmoAllBlock).getOrElse(false.B)}
+
+  io.l2FlushDone.foreach {_ := RegNext(sinkA.io.cmoAll.map(_.l2FlushDone).getOrElse(false.B))}
 
   /* ===== Hardware Performance Monitor ===== */
   val perfEvents = Seq(mshrCtl, mainPipe).flatMap(_.getPerfEvents)

@@ -22,7 +22,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink.TLPermissions._
 import utility.MemReqSource
-import tl2chi.{HasCHIMsgParameters, HasCHIChannelBits, CHIREQ, MemAttr, OrderEncodings}
+import tl2chi.{HasCHIMsgParameters, HasCHIChannelBits, CHIREQ, MemAttr, OrderEncodings, MPAM}
 
 abstract class L2Module(implicit val p: Parameters) extends Module with HasCoupledL2Parameters
 abstract class L2Bundle(implicit val p: Parameters) extends Bundle with HasCoupledL2Parameters
@@ -84,6 +84,9 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val useProbeData = Bool()               // data source, true for ReleaseBuf and false for RefillBuf
   val mshrRetry = Bool()                  // is retry task for mshr conflict
 
+  val readProbeDataDown = Bool()          // whether data from ReleaseBuf was needed on mainpipe by downward operations
+                                          // reads by upwards was handled in RequestArb by 'mshrTask_s2_a_upwards'
+
   // For Intent
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?
                                           // If true, MSHR should send an ack to L2 prefetcher.
@@ -107,7 +110,8 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val replTask = Bool()
 
   // for CMO
-  val cmoTask = Bool()
+  val cmoTask = Bool() // cmo with address
+  val cmoAll = Bool()  // cmo without address but to flush whole L2$ to memory 
 
   // for Matrix
   val matrixTask = Bool()
@@ -123,9 +127,11 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
 
   // Used for get data from ReleaseBuf when snoop hit with same PA 
   val snpHitRelease = Bool()
-  val snpHitReleaseToB = Bool()
+  val snpHitReleaseToInval = Bool()
+  val snpHitReleaseToClean = Bool()
   val snpHitReleaseWithData = Bool()
   val snpHitReleaseIdx = UInt(mshrBits.W) 
+  val snpHitReleaseMeta = new MetaEntry
   // CHI
   val tgtID = chiOpt.map(_ => UInt(TGTID_WIDTH.W))
   val srcID = chiOpt.map(_ => UInt(SRCID_WIDTH.W))
@@ -139,10 +145,12 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val fwdState = chiOpt.map(_ => UInt(FWDSTATE_WIDTH.W))
   val pCrdType = chiOpt.map(_ => UInt(PCRDTYPE_WIDTH.W))
   val retToSrc = chiOpt.map(_ => Bool()) // only used in snoop
+  val likelyshared = chiOpt.map(_ => Bool())
   val expCompAck = chiOpt.map(_ => Bool())
   val allowRetry = chiOpt.map(_ => Bool())
   val memAttr = chiOpt.map(_ => new MemAttr)
   val traceTag = chiOpt.map(_ => Bool())
+  val dataCheckErr = chiOpt.map(_ => Bool())
 
   def toCHIREQBundle(): CHIREQ = {
     val req = WireInit(0.U.asTypeOf(new CHIREQ()))
@@ -152,12 +160,15 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
     req.txnID := txnID.getOrElse(0.U)
     req.opcode := chiOpcode.getOrElse(0.U)
     req.addr := Cat(tag, set, 0.U(offsetBits.W))
+    req.ns := enableNS.B
     req.allowRetry := allowRetry.getOrElse(true.B)  //TODO: consider retry
     req.pCrdType := pCrdType.getOrElse(0.U)
     req.expCompAck := expCompAck.getOrElse(false.B)
+    req.likelyshared := likelyshared.getOrElse(false.B)
     req.memAttr := memAttr.getOrElse(MemAttr())
     req.snpAttr := true.B
     req.order := OrderEncodings.None
+    req.mpam.foreach(_ := MPAM(req.ns))
     req
   }
 }
@@ -201,8 +212,8 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   // PS: ReleaseTask is also responsible for writing refillData to DS when A miss
   val blockRefill = Bool()
 
+  val meta = new MetaEntry
   val metaTag = UInt(tagBits.W)
-  val metaState = UInt(stateBits.W)
   val dirHit = Bool()
 
   // to drop duplicate prefetch reqs
@@ -217,14 +228,15 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val s_release = Bool()
   val s_refill = Bool()
   val s_cmoresp = Bool()
+  val s_cmometaw = Bool()
   val w_releaseack = Bool()
   val w_replResp = Bool()
   val w_rprobeacklast = Bool()
 
   val replaceData = Bool() // If there is a replace, WriteBackFull or Evict
 
-  // exclude Release toB for nested snoop of releases
-  val releaseToB = Bool()
+  // release to T with data or UC (e.g. WriteCleanFull)
+  val releaseToClean = Bool()
 }
 
 class RespInfoBundle(implicit p: Parameters) extends L2Bundle
@@ -235,6 +247,7 @@ class RespInfoBundle(implicit p: Parameters) extends L2Bundle
   val last = Bool() // last beat
   val dirty = Bool() // only used for sinkD resps
   val isHit = Bool() // only used for sinkD resps
+  val denied = Bool()
   val corrupt = Bool()
  //CHI
   val chiOpcode = chiOpt.map(_ => UInt(OPCODE_WIDTH.W))
@@ -246,6 +259,7 @@ class RespInfoBundle(implicit p: Parameters) extends L2Bundle
   val pCrdType = chiOpt.map(_ => UInt(PCRDTYPE_WIDTH.W))
   val respErr = chiOpt.map(_ => UInt(RESPERR_WIDTH.W))
   val traceTag = chiOpt.map(_ => Bool())
+  val dataCheckErr = chiOpt.map(_ => Bool())
 }
 
 class RespBundle(implicit p: Parameters) extends L2Bundle {
@@ -268,13 +282,13 @@ class FSMState(implicit p: Parameters) extends L2Bundle {
   // val s_triggerprefetch = prefetchOpt.map(_ => Bool())
   val s_retry = Bool()    // need retry when conflict
   val s_cmoresp = Bool()  // resp upwards for finishing CMO transactions
+  val s_cmometaw = Bool() // meta write compensation for CMO transactions
 
   // wait
   val w_rprobeackfirst = Bool()
   val w_rprobeacklast = Bool()
   val w_pprobeackfirst = Bool()
   val w_pprobeacklast = Bool()
-  val w_pprobeack = Bool()
   val w_grantfirst = Bool()
   val w_grantlast = Bool()
   val w_grant = Bool()
@@ -282,7 +296,8 @@ class FSMState(implicit p: Parameters) extends L2Bundle {
   val w_replResp = Bool()
 
   // CHI
-  val s_compack = chiOpt.map(_ => Bool())
+  val s_rcompack = chiOpt.map(_ => Bool())
+  val s_wcompack = chiOpt.map(_ => Bool())
   val s_cbwrdata = chiOpt.map(_ => Bool())
   val s_reissue = chiOpt.map(_ => Bool())
   val s_dct = chiOpt.map(_ => Bool())
@@ -321,11 +336,22 @@ class NestedWriteback(implicit p: Parameters) extends L2Bundle {
   val tag = UInt(tagBits.W)
   // Nested ReleaseData sets block dirty
   val c_set_dirty = Bool()
+  // Nested Release sets block TIP
+  val c_set_tip = Bool()
   // Nested Snoop invalidates block
   val b_inv_dirty = Bool()
 
   val b_toB = chiOpt.map(_ => Bool())
   val b_toN = chiOpt.map(_ => Bool())
+  val b_toClean = chiOpt.map(_ => Bool())
+}
+
+class PrefetchCtrlFromCore extends Bundle {
+  val l2_pf_master_en = Bool()
+  val l2_pf_recv_en = Bool()
+  val l2_pbop_en = Bool()
+  val l2_vbop_en = Bool()
+  val l2_tp_en = Bool()
 }
 
 class PrefetchRecv extends Bundle {
@@ -440,4 +466,13 @@ class PCrdGrantMatcher(val numPorts: Int) extends Module {
 class L2CacheErrorInfo(implicit p: Parameters) extends L2Bundle {
   val valid = Bool()
   val address = UInt(addressBits.W)
+}
+
+class IOCMOAll(implicit p: Parameters) extends Bundle {
+  val l2Flush = Input(Bool())      // cmo flush l2$ all enable
+  val l2FlushDone = Output(Bool()) // cmo flush l2$ all done 
+
+  val cmoLineDone = Input(Bool())  // during process of cmo flush all, flush 1 CacheLine is done 
+  val mshrValid = Input(Bool())    // 1: mshr has entry valid  0: no mshr entry valid
+  val cmoAllBlock = Output(Bool()) // 1: in process of cmo flush all  0: not in process of cmo flush all
 }

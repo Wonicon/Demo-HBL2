@@ -21,16 +21,19 @@ package coupledL2
 
 import chisel3._
 import chisel3.util._
-import utility.{FastArbiter, ParallelMax, ParallelPriorityMux, Pipeline, RegNextN, XSPerfAccumulate, HasPerfEvents, PipelineConnect}
+import utility._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.util._
-import org.chipsalliance.cde.config.{Parameters, Field}
+import org.chipsalliance.cde.config.{Field, Parameters}
+
 import scala.math.max
 import coupledL2.prefetch._
-import huancun.{TPmetaReq, TPmetaResp, BankBitsKey}
+import huancun.{BankBitsKey, TPmetaReq, TPmetaResp}
+import utility.mbist.{MbistInterface, MbistPipeline}
+import utility.sram.{SramBroadcastBundle, SramHelper}
 
 trait HasCoupledL2Parameters {
   val p: Parameters
@@ -41,6 +44,7 @@ trait HasCoupledL2Parameters {
   def XLEN = 64
   def blocks = cacheParams.sets * cacheParams.ways
   def blockBytes = cacheParams.blockBytes
+  def blockBits = blockBytes * 8
   def beatBytes = cacheParams.channelBytes.d.get
   def beatSize = blockBytes / beatBytes
 
@@ -70,26 +74,28 @@ trait HasCoupledL2Parameters {
   def mmioBridgeSize = cacheParams.mmioBridgeSize
 
   // ECC
+  // tag(data)BankSplit refers to tag(data) splits before ECC encode
+  // tag(data)SRAMSplit refers to tag(data) splits of tag(data)Array SRAM
+  // *NOTICE*
+  // tag width = 31(1 MB L2), requires padding when split
+  // currently, not split tag if SRAM's split requirement cannot meet(L2 size changes)
+  // encDataBank width = 137(bakSplit = 4), requires padding when extra SRAM split
   def enableECC = cacheParams.enableTagECC || cacheParams.enableDataECC
   def enableTagECC = cacheParams.enableTagECC
-  def eccDataBankSplit = 4 // SRAM dataSplit = 4
-  def encTagBits = cacheParams.tagCode.width(tagBits)
-  def eccTagBits = encTagBits - tagBits
+  def tagBankSplit = 1
+  def tagSRAMSplit = 2
+  def tagBankBits = tagBits / tagBankSplit
+  def encTagBankBits = cacheParams.tagCode.width(tagBankBits)
+  def enableTagSRAMSplit = encTagBankBits % (tagSRAMSplit / tagBankSplit) == 0
+  def eccTagBankBits = encTagBankBits - tagBankBits
   def enableDataECC = cacheParams.enableDataECC
-  def encDataBits = cacheParams.dataCode.width(blockBytes * 8)
-  def eccDataBits = encDataBits - blockBytes * 8
-  def encDataPaddingBits = ((encDataBits + 3) / eccDataBankSplit) * eccDataBankSplit
-  def encDataBankBits = cacheParams.dataCode.width(blockBytes * 2)
-  def eccDataBankBits = encDataBits - blockBytes * 2
-
-  // DataCheck
-  def dataCheckMethod : Int = cacheParams.dataCheck.getOrElse("none").toLowerCase match {
-    case "none" => 0
-    case "oddparity" => 1
-    case "secded" => 2
-    case _ => 0
-  }
-  def enableDataCheck = enableCHI && dataCheckMethod != 0
+  def dataBankSplit = 4
+  def dataSRAMSplit = 8
+  def wordBits = 64
+  def bankWords = blockBits / wordBits / dataBankSplit
+  def dataBankBits = wordBits * bankWords
+  def encBankBits = cacheParams.dataCode.width(dataBankBits)
+  def encDataPadBits = 4 // recaculate if any split changes
 
   // Prefetch
   def prefetchers = cacheParams.prefetch
@@ -173,14 +179,14 @@ trait HasCoupledL2Parameters {
     val offset = x // TODO: check address mapping
     val set = offset >> offsetBits
     val tag = set >> setBits
-    (tag(fullTagBits - 1, 0), set(setBits - 1, 0), offset(offsetBits - 1, 0))
+    (ZeroExt(tag, fullTagBits), set(setBits - 1, 0), offset(offsetBits - 1, 0))
   }
 
   def parseAddress(x: UInt): (UInt, UInt, UInt) = {
     val offset = x
     val set = offset >> (offsetBits + bankBits)
     val tag = set >> setBits
-    (tag(tagBits - 1, 0), set(setBits - 1, 0), offset(offsetBits - 1, 0))
+    (ZeroExt(tag, tagBits), set(setBits - 1, 0), offset(offsetBits - 1, 0))
   }
 
   def restoreAddress(x: UInt, idx: Int) = {
@@ -223,11 +229,11 @@ trait HasCoupledL2Parameters {
   }
 
   def sizeBytesToStr(sizeBytes: Double): String = sizeBytes match {
-    case _ if sizeBytes >= 1024 * 1024 => (sizeBytes / 1024 / 1024) + "MB"
-    case _ if sizeBytes >= 1024        => (sizeBytes / 1024) + "KB"
+    case _ if sizeBytes >= 1024 * 1024 => s"${sizeBytes / 1024 / 1024}MB"
+    case _ if sizeBytes >= 1024        => s"${sizeBytes / 1024}KB"
     case _                            => "B"
   }
-  
+
   def print_bundle_fields(fs: Seq[BundleFieldBase], prefix: String) = {
     if(fs.nonEmpty){
       println(fs.map{f => s"$prefix/${f.key.name}: (${f.data.getWidth}-bit)"}.mkString("\n"))
@@ -271,7 +277,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
     requestKeys = cacheParams.reqKey,
     endSinkId = idsAll
   )
-  
+
   val clientPortParams = (m: TLMasterPortParameters) => TLMasterPortParameters.v2(
     Seq(
       TLMasterParameters.v2(
@@ -315,6 +321,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
 
     val io = IO(new Bundle {
       val hartId = Input(UInt(hartIdLen.W))
+      val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
     //  val l2_hint = Valid(UInt(32.W))
       // DecoupledIO(new MatrixDataBundle())
       val matrixDataOut512L2 = Vec(banks, DecoupledIO(new MatrixDataBundle()))
@@ -326,7 +333,12 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         val robHeadPaddr = Flipped(Valid(UInt(36.W)))
         val l2MissMatch = Output(Bool())
       }
+      val l2Miss = Output(Bool())
       val error = Output(new L2CacheErrorInfo()(l2ECCParams))
+      val l2Flush = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
+      val l2FlushDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
+      val dft = Option.when(cacheParams.hasDFT)(Input(new SramBroadcastBundle))
+      val dft_reset = Option.when(cacheParams.hasMbist)(Input(new DFTResetSignals()))
     })
 
     // Display info
@@ -366,6 +378,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         fastArb(prefetchTrains.get, prefetcher.get.io.train, Some("prefetch_train"))
         prefetcher.get.io.req.ready := Cat(prefetchReqsReady).orR
         prefetcher.get.hartId := io.hartId
+        prefetcher.get.pfCtrlFromCore := io.pfCtrlFromCore
         fastArb(prefetchResps.get, prefetcher.get.io.resp, Some("prefetch_resp"))
         prefetcher.get.io.tlb_req <> io.l2_tlb_req
     }
@@ -374,12 +387,10 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         prefetcher.get.io.recv_addr.valid := x.in.head._1.addr_valid
         prefetcher.get.io.recv_addr.bits.addr := x.in.head._1.addr
         prefetcher.get.io.recv_addr.bits.pfSource := x.in.head._1.pf_source
-        prefetcher.get.io_l2_pf_en := x.in.head._1.l2_pf_en
       case None =>
         prefetcher.foreach{
           p =>
             p.io.recv_addr := 0.U.asTypeOf(p.io.recv_addr)
-            p.io_l2_pf_en := false.B
         }
     }
     tpmeta_source_node match {
@@ -448,11 +459,13 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
 
         slice.io.error.ready := enableECC.asBool // TODO: fix the datapath as optional
 
+        slice.io.l2Flush.foreach(_ := io.l2Flush.getOrElse(false.B))
+
         slice.io.prefetch.zip(prefetcher).foreach {
           case (s, p) =>
-            s.req.valid := p.io.req.valid && bank_eq(p.io.req.bits.set, i, bankBits)
+            s.req.valid := p.io.req.valid && bank_eq(Cat(p.io.req.bits.tag, p.io.req.bits.set), i, bankBits)
             s.req.bits := p.io.req.bits
-            prefetchReqsReady(i) := s.req.ready && bank_eq(p.io.req.bits.set, i, bankBits)
+            prefetchReqsReady(i) := s.req.ready && bank_eq(Cat(p.io.req.bits.tag, p.io.req.bits.set), i, bankBits)
             val train = Pipeline(s.train)
             val resp = Pipeline(s.resp)
             prefetchTrains.get(i) <> train
@@ -482,7 +495,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
     }
 
     val perfEvents = Seq(("noEvent", 0.U)) ++ slices.zipWithIndex.map {
-      case (slide, slide_idx) => 
+      case (slide, slide_idx) =>
         slide.getPerfEvents.map{case (str, idx) => ("Slice" + slide_idx.toString + "_" + str, idx)}
     }.flatten
     generatePerfEvent()
@@ -505,6 +518,9 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
       io.error.valid := false.B
       io.error.address := 0.U.asTypeOf(io.error.address)
     }
+
+    //L2 Flush Done
+    io.l2FlushDone.foreach(_ :=  VecInit(slices.zipWithIndex.map { case (s, i) => s.io.l2FlushDone.getOrElse(false.B)}).reduce(_&_) )
 
     // Refill hint
     if (enableHintGuidedGrant) {
@@ -536,7 +552,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
     slices.zip(node.out).zipWithIndex.foreach {
       case ((slice, (out, _)), i) =>
         slice match {
-          case slice: tl2tl.Slice => 
+          case slice: tl2tl.Slice =>
             out <> slice.io.out
             out.a.bits.address := restoreAddress(slice.io.out.a.bits.address, i)
             out.c.bits.address := restoreAddress(slice.io.out.c.bits.address, i)
@@ -569,8 +585,10 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
       case None => io.debugTopDown.l2MissMatch := false.B
     }
 
+    io.l2Miss := RegNext(slices.map(_.io.l2Miss).reduce(_ || _))
+
     // ==================== XSPerf Counters ====================
-    val grant_data_fire = slices.map { slice => 
+    val grant_data_fire = slices.map { slice =>
       val (first, _, _, _) = node.in.head._2.count(slice.io.in.d)
       slice.io.in.d.fire && first && slice.io.in.d.bits.opcode === GrantData
     }
@@ -597,5 +615,46 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
 
     val okHint = grant_data_fire.orR && hintPipe1.io.out.valid && hintPipe1.io.out.bits === grant_data_source
     XSPerfAccumulate("ok2Hints", okHint)
+
+    private val sigFromSrams = Option.when(cacheParams.hasDFT)(SramHelper.genBroadCastBundleTop())
+    private val cg = Option.when(cacheParams.hasMbist)(utility.ClockGate.genTeSrc)
+    if (cacheParams.hasMbist) {
+      cg.get.cgen := io.dft.get.cgen
+    }
+    sigFromSrams.foreach { sig => sig := DontCare }
+    sigFromSrams.zip(io.dft).foreach {
+      case (sig, dft) =>
+        if (cacheParams.hasMbist) {
+          sig.ram_hold := dft.ram_hold
+          sig.ram_bypass := dft.ram_bypass
+          sig.ram_bp_clken := dft.ram_bp_clken
+          sig.ram_aux_clk := dft.ram_aux_clk
+          sig.ram_aux_ckbp := dft.ram_aux_ckbp
+          sig.ram_mcp_hold := dft.ram_mcp_hold
+          sig.cgen := dft.cgen
+        }
+        if (cacheParams.hasSramCtl) {
+          sig.ram_ctl := dft.ram_ctl
+        }
+    }
+
+    private val mbistPl = MbistPipeline.PlaceMbistPipeline(Int.MaxValue, "L2Cache", cacheParams.hasMbist)
+    private val l2MbistIntf = if (cacheParams.hasMbist) {
+      val params = mbistPl.get.nodeParams
+      val intf = Some(Module(new MbistInterface(
+        params = Seq(params),
+        ids = Seq(mbistPl.get.childrenIds),
+        name = s"MbistIntfL2",
+        pipelineNum = 1
+      )))
+      intf.get.toPipeline.head <> mbistPl.get.mbist
+      if (cacheParams.hartId == 0) mbistPl.get.registerCSV(intf.get.info, "MbistL2")
+      intf.get.mbist := DontCare
+      dontTouch(intf.get.mbist)
+      //TODO: add mbist controller connections here
+      intf
+    } else {
+      None
+    }
   }
 }

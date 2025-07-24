@@ -135,24 +135,23 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
   mshrCtl.io.grantStatus := grantBuf.io.grantStatus
 
   // grantBuf.io.d_task <> mainPipe.io.toSourceD
-  matrixSourceD.io.d_task <>mainPipe.io.toSourceD
-  grantBuf.io.d_task  <> matrixSourceD.io.toSourceD
+  matrixSourceD.io.d_task <> mainPipe.io.toSourceD
+  grantBuf.io.d_task <> matrixSourceD.io.toSourceD
 
   grantBuf.io.fromReqArb.status_s1 := reqArb.io.status_s1
   grantBuf.io.pipeStatusVec := reqArb.io.status_vec ++ mainPipe.io.status_vec_toD
   mshrCtl.io.pipeStatusVec(0) := (reqArb.io.status_vec)(1) // s2 status
   mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(0) // s3 status
 
-  io.prefetch.foreach {
-    p =>
-      p.train <> mainPipe.io.prefetchTrain.get
-      sinkA.io.prefetchReq.get <> p.req
-      p.resp <> grantBuf.io.prefetchResp.get
-      p.tlb_req.req.ready := true.B
-      p.tlb_req.resp.valid := false.B
-      p.tlb_req.resp.bits := DontCare
-      p.tlb_req.pmp_resp := DontCare
-      p.recv_addr := 0.U.asTypeOf(p.recv_addr)
+  io.prefetch.foreach { p =>
+    p.train <> mainPipe.io.prefetchTrain.get
+    sinkA.io.prefetchReq.get <> p.req
+    p.resp <> grantBuf.io.prefetchResp.get
+    p.tlb_req.req.ready := true.B
+    p.tlb_req.resp.valid := false.B
+    p.tlb_req.resp.bits := DontCare
+    p.tlb_req.pmp_resp := DontCare
+    p.recv_addr := 0.U.asTypeOf(p.recv_addr)
   }
 
   /* input & output signals */
@@ -171,8 +170,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
   // sinkC.io.c <> inBuf.c(io.in.c)
   io.in.d <> inBuf.d(grantBuf.io.d)
   grantBuf.io.e <> inBuf.e(io.in.e)
-  io.error.valid := mainPipe.io.error.valid
-  io.error.bits := mainPipe.io.error.bits
+  io.error.valid := RegNext(mainPipe.io.error.valid, false.B)
+  io.error.bits := RegNext(mainPipe.io.error.bits)
   io.matrixDataOut <> matrixSourceD.io.toMatrixD
 
   /* connect downward channels */
@@ -182,17 +181,23 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
   refillUnit.io.sinkD <> outBuf.d(io.out.d)
   io.out.e <> outBuf.e(refillUnit.io.sourceE)
 
+  /* tie cmo All channels */
+  sinkA.io.cmoAll.foreach { cmoAll => cmoAll.mshrValid := false.B }
+  sinkA.io.cmoAll.foreach { cmoAll => cmoAll.cmoLineDone := false.B }
+  sinkA.io.cmoAll.foreach { cmoAll => cmoAll.l2Flush := false.B }
+
+  io.l2FlushDone.foreach { _ := false.B }
+
   dontTouch(io.in)
   dontTouch(io.out)
 
-  topDownOpt.foreach (
-    _ => {
-      io_msStatus.get        := mshrCtl.io.msStatus.get
-      io.dirResult.get.valid := directory.io.resp.valid && !directory.io.replResp.valid // exclude MSHR-Grant read-dir
-      io.dirResult.get.bits  := directory.io.resp.bits
-      io.latePF.get          := a_reqBuf.io.hasLatePF
-    }
-  )
+  topDownOpt.foreach(_ => {
+    io_msStatus.get := mshrCtl.io.msStatus.get
+    io.dirResult.get.valid := directory.io.resp.valid && !directory.io.replResp.valid // exclude MSHR-Grant read-dir
+    io.dirResult.get.bits := directory.io.resp.bits
+    io.latePF.get := a_reqBuf.io.hasLatePF
+  })
+  io.l2Miss := mshrCtl.io.l2Miss
 
   if (cacheParams.enablePerf) {
     val a_begin_times = RegInit(VecInit(Seq.fill(sourceIdAll)(0.U(64.W))))
@@ -200,7 +205,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
     timer := timer + 1.U
     a_begin_times.zipWithIndex.foreach {
       case (r, i) =>
-        when (sinkA.io.a.fire && sinkA.io.a.bits.source === i.U) {
+        when(sinkA.io.a.fire && sinkA.io.a.bits.source === i.U) {
           r := timer
         }
     }

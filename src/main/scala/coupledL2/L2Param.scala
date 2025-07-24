@@ -103,6 +103,8 @@ case class L2Param(
   hartId: Int = 0,
   // Prefetch
   prefetch: Seq[PrefetchParameters] = Nil,
+  // L2 Flush
+  enableL2Flush: Boolean = false,
   // Performance analysis
   enablePerf: Boolean = true,
   // RollingDB
@@ -125,10 +127,15 @@ case class L2Param(
   enableTagECC: Boolean = false,
   enableDataECC: Boolean = false,
   // DataCheck
-  dataCheck: Option[String] = None,
+  dataCheck: Option[String] = Some("oddparity"),
+  enablePoison: Boolean = true,
 
   // Network layer SAM
-  sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0)
+  sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0),
+
+  // Enable sram test support
+  hasMbist: Boolean = false,
+  hasSramCtl: Boolean = false,
 ) {
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
@@ -140,6 +147,8 @@ case class L2Param(
 
   def tagCode: Code = Code.fromString(tagECC)
   def dataCode: Code = Code.fromString(dataECC)
+
+  def hasDFT: Boolean = hasMbist || hasSramCtl
 }
 
 case object L2ParamKey extends Field[L2Param](L2Param())

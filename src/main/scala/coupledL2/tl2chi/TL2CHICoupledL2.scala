@@ -19,7 +19,7 @@ package coupledL2.tl2chi
 
 import chisel3._
 import chisel3.util._
-import utility.{FastArbiter, Pipeline, ParallelPriorityMux, RegNextN, RRArbiterInit}
+import utility.{FastArbiter, Pipeline, ParallelPriorityMux, RegNextN, RRArbiterInit, XSPerfAccumulate}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
@@ -70,6 +70,7 @@ class TL2CHICoupledL2(implicit p: Parameters) extends CoupledL2Base {
 
     val io_chi = IO(new PortIO)
     val io_nodeID = IO(Input(UInt()))
+    val io_cpu_halt = Option.when(cacheParams.enableL2Flush) (IO(Input(Bool())))
 
     // Check port width
     require(io_chi.tx.rsp.getWidth == io_chi.rx.rsp.getWidth);
@@ -127,7 +128,7 @@ class TL2CHICoupledL2(implicit p: Parameters) extends CoupledL2Base {
     slices match {
       case slices: Seq[Slice] =>
         // TXREQ
-        val txreq_arb = Module(new Arbiter(new CHIREQ, slices.size + 1)) // plus 1 for MMIO
+        val txreq_arb = Module(new RRArbiterInit(new CHIREQ, slices.size + 1)) // plus 1 for MMIO
         val txreq = Wire(DecoupledIO(new CHIREQ))
         slices.zip(txreq_arb.io.in.init).foreach { case (s, in) => in <> s.io.out.tx.req }
         txreq_arb.io.in.last <> mmio.io.tx.req
@@ -255,6 +256,15 @@ class TL2CHICoupledL2(implicit p: Parameters) extends CoupledL2Base {
         rxdat <> linkMonitor.io.in.rx.dat
         io_chi <> linkMonitor.io.out
         linkMonitor.io.nodeID := io_nodeID
+        /* exit coherency when: l2 flush of all slices is done and core is in WFI state */
+        linkMonitor.io.exitco.foreach { _ :=
+          Cat(slices.zipWithIndex.map { case (s, i) => s.io.l2FlushDone.getOrElse(false.B)}).andR && io_cpu_halt.getOrElse(false.B)
+        }
+
+        /**
+          * performance counters
+          */
+        XSPerfAccumulate("pcrd_count", pCrdQueue.io.enq.fire)
     }
   }
 

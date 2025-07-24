@@ -22,10 +22,26 @@ import chisel3.util._
 
 trait HasCHIOpcodes extends HasCHIMsgParameters {
 
-  def Eb_REQ_OPCODE_WIDTH = ISSUE_Eb_CONFIG("REQ_OPCODE_WIDTH")
-  def Eb_RSP_OPCODE_WIDTH = ISSUE_Eb_CONFIG("RSP_OPCODE_WIDTH")
-  def Eb_SNP_OPCODE_WIDTH = ISSUE_Eb_CONFIG("SNP_OPCODE_WIDTH")
-  def Eb_DAT_OPCODE_WIDTH = ISSUE_Eb_CONFIG("DAT_OPCODE_WIDTH")
+  def X_OPCODE(opcode: UInt, width: Int, x: String): UInt = {
+    require(
+      opcode.getWidth <= width && after(issue, x),
+      s"Illegal opcode of issue ${issue}, please use afterIssueXXOrElse or ifAfterIssueXX."
+    )
+    opcode(width - 1, 0)
+  }
+  def C_OPCODE(opcode: UInt, width: Int) = X_OPCODE(opcode, width, Issue.C)
+  def Eb_OPCODE(opcode: UInt, width: Int) = X_OPCODE(opcode, width, Issue.Eb)
+
+  def afterIssueXOrElse[T <: Data](block: => T, otherwise: => T, x: String) = {
+    if (after(issue, x)) block
+    else otherwise
+  }
+  def ifAfterIssueX(block: => Any, x: String) = { if (after(issue, x)) block }
+
+  def afterIssueCOrElse[T <: Data](block: => T, otherwise: => T) = afterIssueXOrElse(block, otherwise, Issue.C)
+  def afterIssueEbOrElse[T <: Data](block: => T, otherwise: => T) = afterIssueXOrElse(block, otherwise, Issue.Eb)
+  def ifAfterIssueC(block: => Any) = ifAfterIssueX(block, Issue.C)
+  def ifAfterIssueEb(block: => Any) = ifAfterIssueX(block, Issue.Eb)
 
   /**
     * REQ
@@ -85,6 +101,8 @@ trait HasCHIOpcodes extends HasCHIMsgParameters {
   def AtomicCompare         = 0x39.U(REQ_OPCODE_WIDTH.W)
   def PrefetchTgt           = 0x3A.U(REQ_OPCODE_WIDTH.W)
 
+  def WriteEvictOrEvict     = Eb_OPCODE(0x42.U, REQ_OPCODE_WIDTH)
+
   /**
     * RSP
     */
@@ -98,9 +116,10 @@ trait HasCHIOpcodes extends HasCHIMsgParameters {
   def PCrdGrant       = 0x7.U(RSP_OPCODE_WIDTH.W)
   def ReadReceipt     = 0x8.U(RSP_OPCODE_WIDTH.W)
   def SnpRespFwded    = 0x9.U(RSP_OPCODE_WIDTH.W)
+  // C
+  def RespSepData     = C_OPCODE(0xB.U, RSP_OPCODE_WIDTH)
   // E.b
-  def RespSepData     = 0xB.U(Eb_RSP_OPCODE_WIDTH.W)
-  def DBIDRespOrd     = 0xE.U(Eb_RSP_OPCODE_WIDTH.W)
+  def DBIDRespOrd     = Eb_OPCODE(0xE.U, RSP_OPCODE_WIDTH)
 
   /**
     * SNP
@@ -120,6 +139,7 @@ trait HasCHIOpcodes extends HasCHIMsgParameters {
   def SnpStashShared        = 0x0C.U(SNP_OPCODE_WIDTH.W)
   def SnpDVMOp              = 0x0D.U(SNP_OPCODE_WIDTH.W)
 
+  def SnpQuery              = Eb_OPCODE(0x10.U, SNP_OPCODE_WIDTH)
   def SnpSharedFwd          = 0x11.U(SNP_OPCODE_WIDTH.W)
   def SnpCleanFwd           = 0x12.U(SNP_OPCODE_WIDTH.W)
   def SnpOnceFwd            = 0x13.U(SNP_OPCODE_WIDTH.W)
@@ -136,12 +156,27 @@ trait HasCHIOpcodes extends HasCHIMsgParameters {
   }
 
   def isSnpXFwd(opcode: UInt): Bool = {
-    opcode >= SnpSharedFwd
+    opcode === SnpSharedFwd || 
+    opcode === SnpCleanFwd || 
+    opcode === SnpOnceFwd ||
+    opcode === SnpNotSharedDirtyFwd ||
+    opcode === SnpUniqueFwd
   }
 
+  def isSnpQuery(opcode: UInt): Bool = {
+    afterIssueEbOrElse(opcode === SnpQuery, false.B)
+  }
 
   def isSnpOnceX(opcode: UInt): Bool = {
     opcode === SnpOnce || opcode === SnpOnceFwd
+  }
+
+  def isSnpOnce(opcode: UInt): Bool = {
+    opcode === SnpOnce
+  }
+
+  def isSnpOnceFwd(opcode: UInt): Bool = {
+    opcode === SnpOnceFwd
   }
 
   def isSnpCleanX(opcode: UInt): Bool = {
@@ -207,8 +242,8 @@ trait HasCHIOpcodes extends HasCHIMsgParameters {
   def SnpRespDataPtl    = 0x5.U(DAT_OPCODE_WIDTH.W)
   def SnpRespDataFwded  = 0x6.U(DAT_OPCODE_WIDTH.W)
   def WriteDataCancel   = 0x7.U(DAT_OPCODE_WIDTH.W)
-  // E.b
-  def DataSepResp       = 0xB.U(Eb_DAT_OPCODE_WIDTH.W)
+  // C
+  def DataSepResp       = C_OPCODE(0xB.U, DAT_OPCODE_WIDTH)
 
   def isSnpRespDataX(opcode: UInt): Bool = {
     opcode === SnpRespData || opcode === SnpRespDataPtl || opcode === SnpRespDataFwded

@@ -45,8 +45,8 @@ case class BOPParameters(
   badScore:       Int = 2,
   tlbReplayCnt:   Int = 10,
   dQEntries: Int = 16,
-  dQLatency: Int = 175,
-  dQMaxLatency: Int = 256,
+  dQLatency: Int = 300,
+  dQMaxLatency: Int = 512,
   offsetList: Seq[Int] = Seq(
     -256, -250, -243, -240, -225, -216, -200,
     -192, -180, -162, -160, -150, -144, -135, -128,
@@ -144,7 +144,7 @@ class TestOffsetResp(implicit p: Parameters) extends BOPBundle {
 
 class TestOffsetBundle(implicit p: Parameters) extends BOPBundle {
   val req = DecoupledIO(new TestOffsetReq)
-  val resp = Flipped(DecoupledIO(new TestOffsetResp))
+  val resp = Flipped(ValidIO(new TestOffsetResp))
 }
 
 class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule {
@@ -171,7 +171,15 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   }
 
   val rrTable = Module(
-    new SRAMTemplate(rrTableEntry(), set = rrTableEntries, way = 1, shouldReset = true, singlePort = true)
+    new SRAMTemplate(
+      rrTableEntry(),
+      set = rrTableEntries,
+      way = 1,
+      shouldReset = true,
+      singlePort = true,
+      hasMbist = cacheParams.hasMbist,
+      hasSramCtl = cacheParams.hasSramCtl
+    )
   )
 
   val wAddr = io.w.bits
@@ -188,11 +196,20 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
 
   assert(!RegNext(io.w.fire && io.r.req.fire), "single port SRAM should not read and write at the same time")
 
+  /** s0: req handshake */
+  val s0_valid = rrTable.io.r.req.fire
+  /** s1: rrTable read result */
+  val s1_valid = RegNext(s0_valid, false.B)
+  val s1_ptr = RegNext(io.r.req.bits.ptr)
+  val s1_hit = rData.valid && rData.tag === RegNext(tag(rAddr))
+  /** s2: return resp to ScoreTable */
+  val s2_valid = RegNext(s1_valid, false.B)
+
   io.w.ready := rrTable.io.w.req.ready && !io.r.req.valid
   io.r.req.ready := true.B
-  io.r.resp.valid := RegNext(rrTable.io.r.req.fire, false.B)
-  io.r.resp.bits.ptr := RegNext(io.r.req.bits.ptr)
-  io.r.resp.bits.hit := rData.valid && rData.tag === RegNext(tag(rAddr))
+  io.r.resp.valid := s2_valid
+  io.r.resp.bits.ptr := RegEnable(s1_ptr, s1_valid)
+  io.r.resp.bits.hit := RegEnable(s1_hit, s1_valid)
 
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
@@ -223,7 +240,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
   val offList = WireInit(VecInit(offsetList.map(off => off.S(offsetWidth.W).asUInt)))
   val ptr = RegInit(0.U(scoreTableIdxBits.W))
   val round = RegInit(0.U(roundBits.W))
-  
+
   val bestOffset = RegInit(2.U(offsetWidth.W)) // the entry with the highest score while traversing
   val bestScore = RegInit(0.U)
   val testOffset = offList(ptr)
@@ -270,7 +287,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
       state := s_idle
     }
 
-    when(io.test.resp.fire && io.test.resp.bits.hit) {
+    when(io.test.resp.valid && io.test.resp.bits.hit) {
       val oldScore = st(io.test.resp.bits.ptr).score
       val newScore = oldScore + 1.U
       val offset = offList(io.test.resp.bits.ptr)
@@ -293,7 +310,6 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
   io.test.req.bits.addr := io.req.bits
   io.test.req.bits.testOffset := testOffset
   io.test.req.bits.ptr := ptr
-  io.test.resp.ready := true.B
 
   XSPerfAccumulate("total_learn_phase", state === s_idle)
   XSPerfAccumulate("total_bop_disable", state === s_idle && isBad)
@@ -508,15 +524,14 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     alloc(i) := s1_valid && s1_invalid_oh(i)
     pf_fired(i) := s0_pf_fire_oh(i)
     exp_drop(i) := s3_tlb_fire_oh(i) && s3_tlb_resp_valid && !s3_tlb_resp.miss && (
-      (e.needT && (s3_tlb_resp.excp.head.pf.st || s3_tlb_resp.excp.head.gpf.st || s3_tlb_resp.excp.head.af.st)) ||
-      (!e.needT && (s3_tlb_resp.excp.head.pf.ld || s3_tlb_resp.excp.head.gpf.ld || s3_tlb_resp.excp.head.af.ld)) ||
+      s3_tlb_resp.excp.head.pf.ld || s3_tlb_resp.excp.head.gpf.ld || s3_tlb_resp.excp.head.af.ld ||
       io.tlb_req.pmp_resp.ld || io.tlb_req.pmp_resp.mmio || Pbmt.isUncache(s3_tlb_resp.pbmt)
     )
     val miss = s3_tlb_fire_oh(i) && s3_tlb_resp_valid && s3_tlb_resp.miss
     tlb_fired(i) := s3_tlb_fire_oh(i) && s3_tlb_resp_valid && !s3_tlb_resp.miss && !exp_drop(i)
     miss_drop(i) := miss && e.replayEn
     miss_first_replay(i) := miss && !e.replayEn
-    
+
     // old data: update replayCnt
     when(valids(i) && e.replayCnt.orR) {
       e.replayCnt := e.replayCnt - 1.U
@@ -546,11 +561,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   for((e, i) <- entries.zipWithIndex){
     tlb_req_arb.io.in(i).valid := valids(i) && !e.paddrValid && !s1_tlb_fire_oh(i) && !s2_tlb_fire_oh(i) && !s3_tlb_fire_oh(i) && !e.replayCnt.orR
     tlb_req_arb.io.in(i).bits.vaddr := e.get_tlb_vaddr()
-    when(e.needT) {
-      tlb_req_arb.io.in(i).bits.cmd := TlbCmd.write
-    }.otherwise{
-      tlb_req_arb.io.in(i).bits.cmd := TlbCmd.read
-    }
+    tlb_req_arb.io.in(i).bits.cmd := TlbCmd.read
     tlb_req_arb.io.in(i).bits.size := 3.U
     tlb_req_arb.io.in(i).bits.kill := false.B
     tlb_req_arb.io.in(i).bits.no_translate := false.B
@@ -562,21 +573,19 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
 
   XSPerfAccumulate("tlb_req", io.tlb_req.req.valid)
   XSPerfAccumulate("tlb_miss", io.tlb_req.resp.valid && io.tlb_req.resp.bits.miss)
-  XSPerfAccumulate("tlb_excp",
-    s3_tlb_resp_valid && !s3_tlb_resp.miss && (
-      (s3_tlb_resp.excp.head.pf.st || s3_tlb_resp.excp.head.gpf.st || s3_tlb_resp.excp.head.af.st) ||
-      (s3_tlb_resp.excp.head.pf.ld || s3_tlb_resp.excp.head.gpf.ld || s3_tlb_resp.excp.head.af.ld) ||
-      io.tlb_req.pmp_resp.ld || io.tlb_req.pmp_resp.mmio || Pbmt.isUncache(s3_tlb_resp.pbmt)
+  XSPerfAccumulate("tlb_excp", s3_tlb_resp_valid && !s3_tlb_resp.miss && (
+    s3_tlb_resp.excp.head.pf.ld || s3_tlb_resp.excp.head.gpf.ld || s3_tlb_resp.excp.head.af.ld ||
+    io.tlb_req.pmp_resp.ld || io.tlb_req.pmp_resp.mmio || Pbmt.isUncache(s3_tlb_resp.pbmt)
   ))
-  XSPerfAccumulate("tlb_excp_pmp_af", s3_tlb_resp_valid && io.tlb_req.pmp_resp.ld)
-  XSPerfAccumulate("tlb_excp_uncache", s3_tlb_resp_valid && (io.tlb_req.pmp_resp.mmio || Pbmt.isUncache(s3_tlb_resp.pbmt)))
+  XSPerfAccumulate("tlb_excp_pmp_af", s3_tlb_resp_valid && !s3_tlb_resp.miss && io.tlb_req.pmp_resp.ld)
+  XSPerfAccumulate("tlb_excp_uncache", s3_tlb_resp_valid && !s3_tlb_resp.miss && (io.tlb_req.pmp_resp.mmio || Pbmt.isUncache(s3_tlb_resp.pbmt)))
   XSPerfAccumulate("entry_alloc", PopCount(alloc))
   XSPerfAccumulate("entry_miss_first_replay", PopCount(miss_first_replay))
   XSPerfAccumulate("entry_miss_drop", PopCount(miss_drop))
   XSPerfAccumulate("entry_excp", PopCount(exp_drop))
   XSPerfAccumulate("entry_merge", io.in_req.valid && s0_match)
   XSPerfAccumulate("entry_pf_fire", PopCount(pf_fired))
-  
+
   /*
   val enTalbe = WireInit(Constantin.createRecord(name+"_isWriteL2BopTable", 1.U))
   val l2BOPTable = ChiselDB. createTable("L2BOPTable", new BopReqBufferEntry, basicDB = false)
@@ -659,6 +668,7 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
 
 class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val io = IO(new Bundle() {
+    val enable = Input(Bool())
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val pbopCrossPage = Input(Bool())
     val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
@@ -666,7 +676,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val resp = Flipped(DecoupledIO(new PrefetchResp))
   })
   // 0 / 1: whether to enable
-  private val enable = Constantin.createRecord("vbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstEnable = Constantin.createRecord("vbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  val enable = io.enable && cstEnable.orR
 
   val delayQueue = Module(new DelayQueue("vbop"))
   val rrTable = Module(new RecentRequestTable("vbop"))
@@ -746,14 +757,14 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   if(virtualTrain){
     io.tlb_req <> reqFilter.io.tlb_req
     io.req <> reqFilter.io.out_req
-    io.req.valid := enable.orR && reqFilter.io.out_req.valid
+    io.req.valid := enable && reqFilter.io.out_req.valid
   } else {
     io.tlb_req.req.valid := false.B
     io.tlb_req.req.bits := DontCare
     io.tlb_req.req_kill := false.B
 
     /* s1 send prefetch req */
-    io.req.valid := enable.orR && s1_req_valid
+    io.req.valid := enable && s1_req_valid
     io.req.bits.tag := parseFullAddress(s1_newFullAddr)._1
     io.req.bits.set := parseFullAddress(s1_newFullAddr)._2
     io.req.bits.vaddr.foreach(_ := 0.U)
@@ -785,6 +796,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
 class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val io = IO(new Bundle() {
+    val enable = Input(Bool())
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val pbopCrossPage = Output(Bool())
     val req = DecoupledIO(new PrefetchReq)
@@ -792,7 +804,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   })
 
   // 0 / 1: whether to enable
-  private val enable = Constantin.createRecord("pbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstEnable = Constantin.createRecord("pbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  val enable = io.enable && cstEnable.orR
 
   val delayQueue = Module(new DelayQueue("pbop"))
   val rrTable = Module(new RecentRequestTable("pbop"))
@@ -826,7 +839,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }
 
   io.pbopCrossPage := crossPage
-  io.req.valid := enable.orR && req_valid
+  io.req.valid := enable && req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
