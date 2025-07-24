@@ -34,19 +34,24 @@ class SourceMD(implicit p: Parameters) extends L2Module {
     val toMatrixD = DecoupledIO(new MatrixDataBundle())
   })
 
+  val mdata_enq = Wire(io.toMatrixD.cloneType)
+  val mdata_deq = Queue(mdata_enq, 16, pipe = true, flow = true)
+
+  mdata_enq.valid := false.B
+  mdata_enq.bits.data.data := 0.U
+  mdata_enq.bits.sourceId := 0.U
+  mdata_enq.bits.channel := 0.U
+
   io.toSourceD <> io.d_task
 
-  when (!io.d_task.bits.task.matrixTask) {
-    io.toSourceD.valid := io.d_task.valid
-    io.toMatrixD.valid := false.B
-    io.toMatrixD.bits.data.data := 0.U
-    io.toMatrixD.bits.sourceId := 0.U
-  }.otherwise {
-    io.toMatrixD.bits.data := io.d_task.bits.data
-    io.toMatrixD.bits.sourceId := io.d_task.bits.task.sourceId
-    io.toMatrixD.valid := io.d_task.valid
+  when (io.d_task.valid && io.d_task.bits.task.matrixTask) {
+    mdata_enq.valid := true.B
+    mdata_enq.bits.data := io.d_task.bits.data
+    mdata_enq.bits.sourceId := io.d_task.bits.task.ameIndex
+    mdata_enq.bits.channel := io.d_task.bits.task.ameChannel
+    assert(io.d_task.bits.task.ameChannel < 8.U, "channel must be valid value (0~7) in matrix task")
     io.toSourceD.valid := false.B
   }
 
-  io.d_task.ready := io.toSourceD.ready || io.toMatrixD.ready
+  io.toMatrixD <> mdata_deq
 }
