@@ -35,7 +35,7 @@ class SourceMD(implicit p: Parameters) extends L2Module {
   })
 
   val mdata_enq = Wire(io.toMatrixD.cloneType)
-  val mdata_deq = Queue(mdata_enq, 16, pipe = true, flow = true)
+  val mdata_deq = Queue(mdata_enq, 128, pipe = true, flow = true)
 
   mdata_enq.valid := false.B
   mdata_enq.bits.data.data := 0.U
